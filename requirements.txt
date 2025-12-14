@@ -1,0 +1,10 @@
+# Python package dependencies
+numpy
+torch
+Pillow
+OpenEXR
+plyfile
+open3d
+scipy
+plotly
+matplotlib

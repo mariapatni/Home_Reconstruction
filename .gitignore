@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data files (DON'T commit these - they're huge!)
+*.ply
+*.exr
+*.png
+*.jpg
+*.jpeg
+data_scenes/
+PLYs/
+EXR_RGBD/
+
+# Temporary files
+*.tmp
+tmp/
+.DS_Store
+
+# Output files
+outputs/
+*.html
+point_cloud*.ply
+combined*.ply
+diagnostic*.html
