@@ -11,9 +11,13 @@ from pathlib import Path
 from PIL import Image
 import OpenEXR
 import Imath
-from plyfile import PlyData
 from scipy.spatial import cKDTree
 import random
+from data_loaders.raw_pc_processing import (
+            create_raw_pointcloud,
+            create_filtered_pointcloud
+        )
+
 
 class Record3DCamera:
     """Camera object compatible with training pipeline"""
@@ -107,7 +111,6 @@ class Record3DCamera:
                     break
             
             if depth_channel is None and len(available_channels) > 0:
-                # Use first available channel if none of the common ones exist
                 depth_channel = available_channels[0]
             
             if depth_channel is None:
@@ -125,16 +128,13 @@ class Record3DCamera:
             
             # Resize to match RGB image dimensions if needed
             if depth.shape[0] != target_height or depth.shape[1] != target_width:
-                # Add batch and channel dimensions for interpolation: [1, 1, H, W]
                 depth = depth.unsqueeze(0).unsqueeze(0)
-                # Resize using bilinear interpolation
                 depth = F.interpolate(
                     depth, 
                     size=(target_height, target_width), 
                     mode='bilinear', 
                     align_corners=False
                 )
-                # Remove batch and channel dimensions: [H, W]
                 depth = depth.squeeze(0).squeeze(0)
             
             return depth
@@ -177,8 +177,7 @@ def load_record3d_metadata(scene_path):
         "poses": [
             [m00, m01, ..., m15],  # 4x4 flattened c2w matrix
             ...
-        ],
-        "initPose": {...}
+        ]
     }
     """
     metadata_path = Path(scene_path) / "EXR_RGBD" / "metadata.json"
@@ -187,9 +186,7 @@ def load_record3d_metadata(scene_path):
         meta = json.load(f)
     
     print(f"Loaded metadata from {metadata_path}")
-    w = meta.get('w', '?')
-    h = meta.get('h', '?')
-    print(f"  Image dimensions: {w}x{h}")
+    print(f"  Image dimensions: {meta.get('w', '?')}x{meta.get('h', '?')}")
     print(f"  Number of frames: {len(meta['poses'])}")
     
     return meta
@@ -205,17 +202,11 @@ def parse_intrinsics(meta, frame_idx=0):
         height: Image height
     """
     # Get image dimensions
-    if 'w' in meta and 'h' in meta:
-        width = meta['w']
-        height = meta['h']
-    else:
-        # Fallback defaults
-        width = 720
-        height = 960
+    width = meta.get('w', 720)
+    height = meta.get('h', 960)
     
     # Get intrinsics
     if 'perFrameIntrinsicCoeffs' in meta and len(meta['perFrameIntrinsicCoeffs']) > frame_idx:
-        # Per-frame intrinsics: [fx, fy, cx, cy] format
         coeffs = meta['perFrameIntrinsicCoeffs'][frame_idx]
         if len(coeffs) >= 4:
             fx, fy, cx, cy = coeffs[0], coeffs[1], coeffs[2], coeffs[3]
@@ -223,17 +214,14 @@ def parse_intrinsics(meta, frame_idx=0):
                           [0, fy, cy],
                           [0, 0, 1]])
         elif len(coeffs) == 9:
-            # Full 3x3 matrix flattened
             K = np.array(coeffs).reshape(3, 3)
         else:
             raise ValueError(f"Unexpected perFrameIntrinsicCoeffs format: {len(coeffs)} elements")
     elif 'K' in meta:
-        # Global intrinsics (flattened 3x3 matrix)
         K_flat = meta['K']
         if len(K_flat) == 9:
             K = np.array(K_flat).reshape(3, 3)
         elif len(K_flat) == 4:
-            # [fx, fy, cx, cy] format
             fx, fy, cx, cy = K_flat
             K = np.array([[fx, 0, cx],
                           [0, fy, cy],
@@ -256,10 +244,8 @@ def parse_pose(meta, frame_idx):
     """
     Parse camera pose from Record3D metadata
     
-    Record3D typically stores 4x4 camera-to-world (c2w) matrices
-    
     Returns:
-        c2w: 4x4 numpy array
+        c2w: 4x4 numpy array (camera-to-world)
     """
     poses = meta['poses']
     
@@ -268,26 +254,19 @@ def parse_pose(meta, frame_idx):
     
     pose_flat = poses[frame_idx]
     
-    # Record3D can store poses in different formats
     if len(pose_flat) == 16:
-        # Flattened 4x4 matrix
         c2w = np.array(pose_flat).reshape(4, 4)
     elif len(pose_flat) == 12:
-        # 3x4 matrix
         c2w = np.array(pose_flat).reshape(3, 4)
         c2w = np.vstack([c2w, [0, 0, 0, 1]])
     elif len(pose_flat) == 7:
-        # Quaternion + translation format: [qx, qy, qz, qw, tx, ty, tz]
+        # Quaternion + translation: [qx, qy, qz, qw, tx, ty, tz]
         qx, qy, qz, qw, tx, ty, tz = pose_flat
-        
-        # Convert quaternion to rotation matrix
         R = np.array([
             [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw), 2*(qx*qz + qy*qw)],
             [2*(qx*qy + qz*qw), 1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw)],
             [2*(qx*qz - qy*qw), 2*(qy*qz + qx*qw), 1 - 2*(qx*qx + qy*qy)]
         ])
-        
-        # Create 4x4 transformation matrix
         c2w = np.eye(4)
         c2w[:3, :3] = R
         c2w[:3, 3] = [tx, ty, tz]
@@ -297,185 +276,207 @@ def parse_pose(meta, frame_idx):
     return c2w
 
 
-def load_and_merge_plys(scene_path, frame_indices, voxel_size=0.005):
+def create_point_cloud_from_rgbd(cam, subsample=4):
     """
-    Load and merge partial point clouds from Record3D
+    Create a point cloud from RGB-D camera data
     
-    FIX: Transform each PLY from camera space to world space before merging.
-    Record3D PLY files are in camera space (relative to each camera), not world space.
+    Args:
+        cam: Record3DCamera object
+        subsample: Subsample factor to reduce point count (use every Nth pixel)
+    
+    Returns:
+        points: Nx3 numpy array of 3D points in world coordinates
+        colors: Nx3 numpy array of RGB colors [0, 1]
+    """
+    if cam.depth_map is None:
+        return None, None
+    
+    # Get image dimensions
+    H, W = cam.depth_map.shape
+    
+    # Create pixel grid (subsampled)
+    u = torch.arange(0, W, subsample, dtype=torch.float32)
+    v = torch.arange(0, H, subsample, dtype=torch.float32)
+    u_grid, v_grid = torch.meshgrid(u, v, indexing='xy')
+    u_flat = u_grid.flatten()
+    v_flat = v_grid.flatten()
+    
+    # Get depth values at these pixels
+    depth_flat = cam.depth_map[v_flat.long(), u_flat.long()]
+    
+    # Filter out invalid depth (zero or NaN)
+    valid = (depth_flat > 0) & torch.isfinite(depth_flat)
+    u_valid = u_flat[valid]
+    v_valid = v_flat[valid]
+    depth_valid = depth_flat[valid]
+    
+    if len(depth_valid) == 0:
+        return None, None
+    
+    # Unproject depth to 3D camera coordinates
+    fx, fy = cam.fx, cam.fy
+    cx, cy = cam.cx, cam.cy
+    
+    x_cam = (u_valid - cx) * depth_valid / fx
+    y_cam = -(v_valid - cy) * depth_valid / fy
+    z_cam = -depth_valid
+    
+    # Stack into [N, 3] tensor
+    points_cam = torch.stack([x_cam, y_cam, z_cam], dim=1)
+    
+    # Transform to world coordinates using c2w matrix
+    ones = torch.ones(len(points_cam), 1)
+    points_cam_hom = torch.cat([points_cam, ones], dim=1)  # [N, 4]
+    points_world_hom = points_cam_hom @ cam.c2w.T  # [N, 4]
+    points_world = points_world_hom[:, :3]
+    
+    # Get RGB colors at valid pixels
+    rgb_flat = cam.original_image[:, v_valid.long(), u_valid.long()].T  # [N, 3]
+    
+    return points_world.numpy(), rgb_flat.numpy()
+
+
+def load_processed_pointcloud(scene_path, custom_path=None):
+    """
+    Load pre-processed point cloud
     
     Args:
         scene_path: Path to scene directory
-        frame_indices: Which frames to include
-        voxel_size: Voxel size for downsampling (in meters)
+        custom_path: Optional custom path to PLY file
     
     Returns:
-        points: Nx3 numpy array of positions in world coordinates
-        colors: Nx3 numpy array of RGB colors [0, 1]
+        points, colors if found, else (None, None)
     """
-    from plyfile import PlyData
+    import open3d as o3d
     
-    ply_dir = Path(scene_path) / "PLYs"
+    # Use custom path if provided, otherwise default to processed.ply
+    if custom_path is not None:
+        ply_path = Path(custom_path)
+    else:
+        ply_path = Path(scene_path) / "processed.ply"
     
-    if not ply_dir.exists():
-        raise ValueError(f"PLY directory not found: {ply_dir}")
+    if not ply_path.exists():
+        return None, None
     
-    # Load metadata for camera poses
-    meta = load_record3d_metadata(scene_path)
+    print(f"Loading point cloud from {ply_path}")
+    pcd = o3d.io.read_point_cloud(str(ply_path))
     
-    all_points = []
-    all_colors = []
+    points = np.asarray(pcd.points)
+    colors = np.asarray(pcd.colors)
     
-    print(f"Loading {len(frame_indices)} point clouds...")
-    
-    for idx in frame_indices:
-        ply_path = ply_dir / f"{idx:05d}.ply"
-        
-        if not ply_path.exists():
-            print(f"  Warning: {ply_path} not found, skipping")
-            continue
-        
-        # Load PLY file using plyfile (in camera space)
-        plydata = PlyData.read(str(ply_path))
-        vertex = plydata['vertex']
-        
-        # Extract x, y, z coordinates
-        x = np.array(vertex['x'])
-        y = np.array(vertex['y'])
-        z = np.array(vertex['z'])
-        points_cam = np.stack([x, y, z], axis=1)  # Camera space
-        
-        # Extract colors if available
-        if 'red' in vertex.dtype.names and 'green' in vertex.dtype.names and 'blue' in vertex.dtype.names:
-            r = np.array(vertex['red'])
-            g = np.array(vertex['green'])
-            b = np.array(vertex['blue'])
-            colors = np.stack([r, g, b], axis=1) / 255.0  # Normalize to [0, 1]
-        else:
-            colors = np.ones((len(points_cam), 3)) * 0.5
-        
-        # FIX: Get camera pose and transform from camera space to world space
-        c2w = parse_pose(meta, idx)
-        
-        # Transform: points_world = R @ points_cam + t
-        # Extract rotation and translation from c2w matrix
-        R = c2w[:3, :3]  # Rotation matrix
-        t = c2w[:3, 3]    # Translation vector
-        
-        # Transform points from camera space to world space
-        points_world = (R @ points_cam.T).T + t
-        
-        all_points.append(points_world)  # Now in world space!
-        all_colors.append(colors)
-        
-        if (len(all_points) % 10) == 0:
-            print(f"  Loaded {len(all_points)} point clouds...")
-    
-    # Merge all point clouds (now all in same world coordinate system)
-    all_points = np.vstack(all_points)
-    all_colors = np.vstack(all_colors)
-    
-    print(f"Merged {len(all_points):,} points")
-    
-    # Downsample using voxel grid (no open3d needed)
-    print(f"\nDownsampling with voxel_size={voxel_size}...")
-    points, colors = voxel_downsample(all_points, all_colors, voxel_size)
-    print(f"  → {len(points):,} points after downsampling")
-    
-    # Remove statistical outliers
-    print("Removing outliers...")
-    points, colors = remove_statistical_outliers(points, colors, nb_neighbors=20, std_ratio=2.0)
-    print(f"  → {len(points):,} points after outlier removal")
-    
-    print(f"\nFinal point cloud: {len(points):,} points")
+    print(f"  Loaded {len(points):,} points")
     
     return points, colors
 
 
-def voxel_downsample(points, colors, voxel_size):
+def save_processed_pointcloud(scene_path, points, colors):
     """
-    Downsample point cloud using voxel grid (no open3d).
+    Save processed point cloud as processed.ply
     
     Args:
-        points: Nx3 array of points
-        colors: Nx3 array of colors
-        voxel_size: Size of voxel grid
-    
-    Returns:
-        downsampled_points, downsampled_colors
+        scene_path: Path to scene directory
+        points: Nx3 numpy array
+        colors: Nx3 numpy array
     """
-    if len(points) == 0:
-        return points, colors
+    import open3d as o3d
     
-    # Compute voxel indices
-    voxel_indices = np.floor(points / voxel_size).astype(int)
+    output_path = Path(scene_path) / "processed.ply"
     
-    # Use dictionary to keep one point per voxel (first point in each voxel)
-    voxel_dict = {}
-    for i in range(len(points)):
-        key = tuple(voxel_indices[i])
-        if key not in voxel_dict:
-            voxel_dict[key] = i
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
     
-    # Extract downsampled points and colors
-    keep_indices = list(voxel_dict.values())
-    return points[keep_indices], colors[keep_indices]
+    o3d.io.write_point_cloud(str(output_path), pcd)
+    print(f"Saved processed point cloud to {output_path}")
 
 
-def remove_statistical_outliers(points, colors, nb_neighbors=20, std_ratio=2.0):
+def reconstruct_from_rgbd(scene_path, frame_indices, subsample=4):
     """
-    Remove statistical outliers using nearest neighbor distances (no open3d).
+    Reconstruct point cloud from RGBD frames
     
     Args:
-        points: Nx3 array of points
-        colors: Nx3 array of colors
-        nb_neighbors: Number of neighbors to consider
-        std_ratio: Standard deviation ratio threshold
+        scene_path: Path to scene directory
+        frame_indices: List of frame indices to use
+        subsample: Subsampling factor for depth unprojection
     
     Returns:
-        filtered_points, filtered_colors
-    """
-    if len(points) == 0:
-        return points, colors
+        points: Nx3 numpy array
+        colors: Nx3 numpy array
+    """    
+    meta = load_record3d_metadata(scene_path)
     
-    from scipy.spatial import cKDTree
+    points_by_frame = []
+    colors_by_frame = []
     
-    # Build KD-tree for fast nearest neighbor search
-    tree = cKDTree(points)
+    print(f"\nReconstructing from {len(frame_indices)} RGBD frames...")
     
-    # Find k nearest neighbors (including the point itself)
-    k = min(nb_neighbors + 1, len(points))
-    distances, _ = tree.query(points, k=k)
+    for idx in frame_indices:
+        # Parse camera parameters
+        K, width, height = parse_intrinsics(meta, idx)
+        c2w = parse_pose(meta, idx)
+        
+        # File paths
+        file_id = str(idx)
+        rgb_path = Path(scene_path) / "EXR_RGBD" / "rgb" / f"{file_id}.png"
+        depth_path = Path(scene_path) / "EXR_RGBD" / "depth" / f"{file_id}.exr"
+        
+        if not rgb_path.exists():
+            rgb_path = Path(scene_path) / "EXR_RGBD" / "rgb" / f"{file_id}.jpg"
+        
+        if not rgb_path.exists():
+            print(f"  Warning: RGB not found for frame {idx}, skipping")
+            continue
+        
+        # Create temporary camera object
+        cam = Record3DCamera(
+            image_path=rgb_path,
+            depth_path=depth_path,
+            c2w=c2w,
+            K=K,
+            width=width,
+            height=height,
+            camera_id=idx,
+            image_name=file_id
+        )
+        
+        # Unproject to 3D
+        points, colors = create_point_cloud_from_rgbd(cam, subsample=subsample)
+        
+        if points is not None and len(points) > 0:
+            points_by_frame.append(points)
+            colors_by_frame.append(colors)
+        
+        if len(points_by_frame) % 10 == 0:
+            print(f"  Processed {len(points_by_frame)} frames...")
     
-    # Compute mean distance to neighbors (excluding self)
-    if k > 1:
-        mean_distances = distances[:, 1:].mean(axis=1)
-    else:
-        mean_distances = np.zeros(len(points))
+    print(f"Total raw points: {sum(len(p) for p in points_by_frame):,}")
+
+    print("\n✓ Applying multiview filtering...")
+    points, colors = create_filtered_pointcloud(
+            points_by_frame,
+            colors_by_frame,
+            voxel_size=0.01,
+            min_views=5,
+            use_sor=True,
+            nb_neighbors=20,
+            std_ratio=1.5
+        )
     
-    # Compute mean and std of mean distances
-    overall_mean = np.mean(mean_distances)
-    overall_std = np.std(mean_distances)
-    
-    # Keep points within threshold
-    threshold = overall_mean + std_ratio * overall_std
-    mask = mean_distances < threshold
-    
-    return points[mask], colors[mask]
+    return points, colors
 
 
 class Record3DScene:
     """Scene loader for Record3D data"""
     
     def __init__(self, scene_path, train_frames=None, test_frames=None,
-                 gaussians=None, voxel_size=0.005):
+                 subsample=4, pointcloud_path=None):
         """
         Args:
             scene_path: Path to scene directory (e.g., "data_scenes/maria_bedroom")
             train_frames: List of frame indices for training (or None for auto)
             test_frames: List of frame indices for testing (or None for auto)
-            gaussians: Gaussian model to initialize
-            voxel_size: Point cloud downsampling resolution
+            subsample: Subsampling factor for RGBD reconstruction
+            pointcloud_path: Optional path to custom PLY file
         """
         self.scene_path = Path(scene_path)
         self.model_path = scene_path  # For compatibility
@@ -486,19 +487,14 @@ class Record3DScene:
         
         # Auto-select frames if not specified
         if train_frames is None:
-            # Every 2nd frame for training
-            train_frames = list(range(0, n_frames, 20))
+            train_frames = list(range(0, n_frames, 20))  # Every 20th frame
         
         if test_frames is None:
-            
-            # Frames not in training set
             all_frames = set(range(n_frames))
             available_test_frames = list(all_frames - set(train_frames))
-            
-            # Randomly sample from available frames
-            num_test_frames = int(len(train_frames) * 0.2)
-            test_frames = sorted(random.sample(available_test_frames, num_test_frames))
-        
+            num_test_frames = max(1, int(len(train_frames) * 0.2))
+            test_frames = sorted(random.sample(available_test_frames, 
+                                             min(num_test_frames, len(available_test_frames))))
         
         print(f"\nDataset split:")
         print(f"  Training: {len(train_frames)} frames")
@@ -508,15 +504,37 @@ class Record3DScene:
         self.train_cameras = self._create_cameras(meta, train_frames)
         self.test_cameras = self._create_cameras(meta, test_frames)
         
-        # Merge point clouds
-        if gaussians is not None:
-            print("\nInitializing Gaussians from point clouds...")
-            points, colors = load_and_merge_plys(
-                self.scene_path,
-                frame_indices=train_frames,
-                voxel_size=voxel_size
-            )
-            self._initialize_gaussians(gaussians, points, colors)
+        # Load point cloud
+        print("\nLoading point cloud...")
+        
+        if pointcloud_path is not None:
+            # Custom path provided - load from there
+            print(f"Using custom point cloud path: {pointcloud_path}")
+            points, colors = load_processed_pointcloud(self.scene_path, custom_path=pointcloud_path)
+            
+            if points is None:
+                raise FileNotFoundError(f"Custom point cloud not found: {pointcloud_path}")
+        
+        else:
+            # No custom path - use processed.ply (create if needed)
+            points, colors = load_processed_pointcloud(self.scene_path, custom_path=None)
+            
+            if points is None:
+                # processed.ply doesn't exist - create it
+                print("processed.ply not found, creating filtered point cloud...")
+                points, colors = reconstruct_from_rgbd(
+                    self.scene_path,
+                    frame_indices=train_frames,
+                    subsample=subsample
+                )
+                
+                # Save as processed.ply
+                save_processed_pointcloud(self.scene_path, points, colors)
+        
+        # Store point cloud
+        self.points = points
+        self.colors = colors
+        print(f"Scene initialized with {len(points):,} points")
         
         # Background color
         self.background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
@@ -528,26 +546,19 @@ class Record3DScene:
         print(f"\nCreating {len(frame_indices)} cameras...")
         
         for idx in frame_indices:
-            # Parse intrinsics
             K, width, height = parse_intrinsics(meta, idx)
-            
-            # Parse pose
             c2w = parse_pose(meta, idx)
             
-            # File paths - use non-padded format (0.png, 0.jpg, 1.png, etc.)
             file_id = str(idx)
             rgb_path = self.scene_path / "EXR_RGBD" / "rgb" / f"{file_id}.png"
             depth_path = self.scene_path / "EXR_RGBD" / "depth" / f"{file_id}.exr"
             
             if not rgb_path.exists():
-                # Try .jpg
                 rgb_path = self.scene_path / "EXR_RGBD" / "rgb" / f"{file_id}.jpg"
             
             if not rgb_path.exists():
                 print(f"  Warning: RGB image not found for frame {idx}, skipping")
                 continue
-            
-            # depth_path can be None if not found (optional)
             
             cam = Record3DCamera(
                 image_path=rgb_path,
@@ -564,45 +575,6 @@ class Record3DScene:
         
         print(f"Created {len(cameras)} cameras")
         return cameras
-    
-    def _initialize_gaussians(self, gaussians, points, colors):
-        """Initialize Gaussian parameters from point cloud"""
-        N = len(points)
-        
-        # Positions
-        gaussians._xyz = nn.Parameter(torch.tensor(points, dtype=torch.float32).cuda())
-        
-        # Colors (convert to SH)
-        SH_C0 = 0.28209479177387814
-        colors_sh = (colors - 0.5) / SH_C0
-        gaussians._features_dc = nn.Parameter(
-            torch.tensor(colors_sh, dtype=torch.float32).unsqueeze(1).cuda()
-        )
-        gaussians._features_rest = nn.Parameter(
-            torch.zeros((N, 15, 3), dtype=torch.float32).cuda()
-        )
-        
-        # Opacity (start mostly transparent)
-        gaussians._opacity = nn.Parameter(
-            torch.ones((N, 1), dtype=torch.float32).cuda() * -2.0  # sigmoid(-2) ≈ 0.12
-        )
-        
-        # Scales (from nearest neighbor distances)
-        print("Computing initial scales from point cloud...")
-        tree = cKDTree(points)
-        distances, _ = tree.query(points, k=4)
-        avg_dist = distances[:, 1:].mean(axis=1)
-        scales = np.log(avg_dist * 0.5)  # Log space
-        gaussians._scaling = nn.Parameter(
-            torch.tensor(np.stack([scales, scales, scales], axis=1), dtype=torch.float32).cuda()
-        )
-        
-        # Rotations (identity)
-        gaussians._rotation = nn.Parameter(
-            torch.tensor([[1, 0, 0, 0]], dtype=torch.float32).repeat(N, 1).cuda()
-        )
-        
-        print(f"Initialized {N} Gaussians")
     
     def getTrainCameras(self):
         return self.train_cameras.copy()
