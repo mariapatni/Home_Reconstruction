@@ -25,7 +25,8 @@ mkdir -p "$TARGET_EXTRACT_DIR"
 
 #Step 1: Combine chunks
 echo "Combining chunk files into $TARGET_ZIP..."
-cat "$CHUNK_DIR"/chunk_* > "$TARGET_ZIP"
+CHUNK_FILES=$(ls -1 "$CHUNK_DIR"/chunk_* 2>/dev/null | sort)
+cat $CHUNK_FILES > "$TARGET_ZIP"
 
 # Step 2: Extract main zip
 echo "Unzipping main archive into $TARGET_EXTRACT_DIR..."

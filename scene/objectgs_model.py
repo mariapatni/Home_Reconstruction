@@ -1,10 +1,16 @@
 """
 ObjectGS: Anchor-based Gaussian Splatting with Object Awareness
-Implements hierarchical representation: Point Cloud → Anchors → Gaussians
+FIXED VERSION - Proper opacity initialization for stable training
+
+Key fixes:
+1. Initialize opacities LOW (inverse_sigmoid(0.1) ≈ -2.2) NOT HIGH!
+2. Better color preservation
+3. Smaller initial scales
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -14,77 +20,61 @@ class Gaussian:
     
     def __init__(self, position, opacity_raw, scale_raw, rotation, 
                  color, object_id, num_objects):
-        """
-        Args:
-            position: [3] 3D position in world space
-            opacity_raw: scalar - raw opacity (before sigmoid)
-            scale_raw: [3] - raw scale (before exp)
-            rotation: [4] - quaternion [w, x, y, z]
-            color: [3] - RGB color [0, 1]
-            object_id: int - which object this belongs to
-            num_objects: int - total number of objects in scene
-        """
         self.position = position
         self.opacity_raw = opacity_raw
         self.scale_raw = scale_raw
         self.rotation = rotation
         self.color = color
         self.object_id = object_id
-        
-        # One-hot semantic encoding (NOT learnable!)
         self.semantic = self._create_one_hot(object_id, num_objects)
     
     def _create_one_hot(self, object_id, num_objects):
-        """Create one-hot encoding for object ID"""
         one_hot = torch.zeros(num_objects)
         one_hot[object_id] = 1.0
         return one_hot
     
     @property
     def opacity(self):
-        """Actual opacity (after sigmoid): [0, 0.999]"""
         return torch.sigmoid(self.opacity_raw).clamp(0, 0.999)
     
     @property
     def scale(self):
-        """Actual scale (after exp): positive values"""
         return torch.exp(self.scale_raw).clamp_min(1e-6)
 
 
 class Anchor(nn.Module):
     """Anchor point that generates k neural Gaussians"""
     
-    def __init__(self, position, object_id, k=10, feature_dim=32):
-        """
-        Args:
-            position: [3] center of voxel in world space
-            object_id: int - which object this anchor belongs to
-            k: int - number of Gaussians to generate per anchor
-            feature_dim: int - dimensionality of anchor feature
-        """
+    def __init__(self, position, color, object_id, k=10, feature_dim=32):
         super().__init__()
         
-        # Register position as buffer (not a parameter, but moves with model)
+        # Register position as buffer
         self.register_buffer('position', torch.tensor(position, dtype=torch.float32))
+        
+        # Store anchor color for initialization
+        self.register_buffer('color', torch.tensor(color, dtype=torch.float32))
+        
         self.object_id = object_id
         self.k = k
         
         # Learnable parameters
-        self.feature = nn.Parameter(torch.randn(feature_dim) * 0.1)
+        # Initialize feature to encode the color
+        feature_init = torch.randn(feature_dim) * 0.1
+        feature_init[:3] = torch.tensor(color, dtype=torch.float32)  # First 3 dims = color
+        self.feature = nn.Parameter(feature_init)
+        
         self.scaling = nn.Parameter(torch.tensor(1.0))
         self.offsets = nn.Parameter(torch.randn(k, 3) * 0.01)
         
     def get_gaussian_positions(self):
-        """
-        Compute positions of k Gaussians from anchor
-        
-        Returns:
-            [k, 3] positions
-        """
-        # Position = anchor_center + offset * scaling
-        # position is now a buffer so it's on the same device
         positions = self.position.unsqueeze(0) + self.offsets * self.scaling
         return positions
+
+
+def inverse_sigmoid(x):
+    """Compute inverse sigmoid (logit)"""
+    x = torch.clamp(x, 1e-6, 1 - 1e-6)
+    return torch.log(x / (1 - x))
 
 
 class AttributeMLP(nn.Module):
@@ -94,29 +84,24 @@ class AttributeMLP(nn.Module):
         super().__init__()
         self.k = k
         
-        # Separate MLPs for different attributes
-        # Opacity: k values
         self.opacity_mlp = nn.Sequential(
             nn.Linear(feature_dim, 64),
             nn.ReLU(),
             nn.Linear(64, k)
         )
         
-        # Scale: k × 3 values (width, height, depth for each Gaussian)
         self.scale_mlp = nn.Sequential(
             nn.Linear(feature_dim, 128),
             nn.ReLU(),
             nn.Linear(128, k * 3)
         )
         
-        # Rotation: k × 4 values (quaternion for each)
         self.rotation_mlp = nn.Sequential(
             nn.Linear(feature_dim, 128),
             nn.ReLU(),
             nn.Linear(128, k * 4)
         )
         
-        # Color: k × 3 values (RGB for each)
         self.color_mlp = nn.Sequential(
             nn.Linear(feature_dim, 128),
             nn.ReLU(),
@@ -125,61 +110,54 @@ class AttributeMLP(nn.Module):
     
     def forward(self, anchor_feature):
         """
-        Generate attributes for k Gaussians from anchor feature
-        
         Args:
-            anchor_feature: [F] anchor feature vector
+            anchor_feature: [N, F] batched anchor features
             
         Returns:
-            opacity_raw: [k] raw opacity values
-            scale_raw: [k, 3] raw scale values
-            rotation: [k, 4] quaternions
-            color: [k, 3] RGB colors
+            opacity_raw: [N, k]
+            scale_raw: [N, k, 3]
+            rotation: [N, k, 4]
+            color: [N, k, 3]
         """
-        opacity_raw = self.opacity_mlp(anchor_feature)  # [k]
+        batch_size = anchor_feature.shape[0]
+        
+        opacity_raw = self.opacity_mlp(anchor_feature)  # [N, k]
         
         scale_raw = self.scale_mlp(anchor_feature)
-        scale_raw = scale_raw.reshape(self.k, 3)  # [k, 3]
+        scale_raw = scale_raw.reshape(batch_size, self.k, 3)  # [N, k, 3]
         
         rotation = self.rotation_mlp(anchor_feature)
-        rotation = rotation.reshape(self.k, 4)  # [k, 4]
-        # Normalize quaternions
+        rotation = rotation.reshape(batch_size, self.k, 4)  # [N, k, 4]
         rotation = rotation / (rotation.norm(dim=-1, keepdim=True) + 1e-9)
         
         color = self.color_mlp(anchor_feature)
-        color = color.reshape(self.k, 3)  # [k, 3]
-        color = torch.sigmoid(color)  # [0, 1]
+        color = color.reshape(batch_size, self.k, 3)  # [N, k, 3]
+        
+        # Use tanh to allow full color range, then scale to [0, 1]
+        color = torch.tanh(color) * 0.5 + 0.5
         
         return opacity_raw, scale_raw, rotation, color
 
 
 class ObjectGSModel(nn.Module):
-    """Main ObjectGS model: manages anchors and generates Gaussians"""
+    """Main ObjectGS model with FIXED initialization"""
     
     def __init__(self, point_cloud, colors, object_ids=None, 
                  voxel_size=0.02, k=10, feature_dim=32):
-        """
-        Args:
-            point_cloud: [N, 3] numpy array of points
-            colors: [N, 3] numpy array of RGB colors [0, 1]
-            object_ids: [N] numpy array of object IDs (or None for all 1s)
-            voxel_size: float - size of voxel grid for anchor placement
-            k: int - number of Gaussians per anchor
-            feature_dim: int - anchor feature dimensionality
-        """
         super().__init__()
         
         self.k = k
         self.feature_dim = feature_dim
         self.voxel_size = voxel_size
         
-        # Set all object IDs to 1 if not provided (placeholder)
         if object_ids is None:
             object_ids = np.ones(len(point_cloud), dtype=np.int32)
         
-        self.num_objects = int(object_ids.max()) + 1  # +1 for background (ID=0)
+        self.num_objects = int(object_ids.max()) + 1
         
-        print(f"\nInitializing ObjectGS model:")
+        print(f"\n{'='*60}")
+        print("Initializing ObjectGS model (FIXED VERSION)")
+        print(f"{'='*60}")
         print(f"  Point cloud: {len(point_cloud):,} points")
         print(f"  Voxel size: {voxel_size}m")
         print(f"  Gaussians per anchor: {k}")
@@ -196,8 +174,70 @@ class ObjectGSModel(nn.Module):
         # MLP for generating Gaussian attributes
         self.attribute_mlp = AttributeMLP(feature_dim=feature_dim, k=k)
         
-        # Device will be set when model is moved
+        # CRITICAL FIX: Initialize MLPs properly for STABLE training
+        with torch.no_grad():
+            # 1. Scale MLP: SMALL initial scales (exp(-4) ≈ 0.018)
+            # Start smaller than before to prevent immediate bloating
+            scale_output = self.attribute_mlp.scale_mlp[-1]
+            if hasattr(scale_output, 'bias') and scale_output.bias is not None:
+                scale_output.bias.data.fill_(-4.0)  # Smaller than before
+            if hasattr(scale_output, 'weight'):
+                scale_output.weight.data *= 0.1  # Small weights
+                print("  ✓ Initialized scales to SMALL (~0.018)")
+            
+            # 2. Opacity MLP: LOW initial opacity (inverse_sigmoid(0.1) ≈ -2.2)
+            # THIS IS THE KEY FIX! Start with low opacity, let it grow during training
+            opacity_output = self.attribute_mlp.opacity_mlp[-1]
+            if hasattr(opacity_output, 'bias') and opacity_output.bias is not None:
+                # inverse_sigmoid(0.1) ≈ -2.197
+                opacity_output.bias.data.fill_(-2.2)
+                print("  ✓ Initialized opacities to LOW (0.1) - KEY FIX!")
+            if hasattr(opacity_output, 'weight'):
+                opacity_output.weight.data *= 0.1  # Small weights
+            
+            # 3. Color MLP: preserve point cloud colors
+            color_output = self.attribute_mlp.color_mlp[-1]
+            if hasattr(color_output, 'weight'):
+                color_output.weight.data *= 0.01  # Very small weights
+            if hasattr(color_output, 'bias') and color_output.bias is not None:
+                color_output.bias.data.zero_()
+                print("  ✓ Initialized colors to preserve point cloud colors")
+            
+            # 4. Rotation MLP: initialize to identity quaternion [0,0,0,1]
+            rotation_output = self.attribute_mlp.rotation_mlp[-1]
+            if hasattr(rotation_output, 'bias') and rotation_output.bias is not None:
+                rotation_output.bias.data.zero_()
+                # Set every 4th element (w component) to 1
+                rotation_output.bias.data[3::4] = 1.0
+        
+        # Device tracking
         self.device = torch.device('cpu')
+        
+        # Pre-compute anchor data
+        self._precompute_anchor_data()
+        
+        print(f"  ✓ Pre-computed anchor data")
+        print(f"{'='*60}\n")
+    
+    def _precompute_anchor_data(self):
+        """Pre-compute anchor object IDs and colors as tensors"""
+        object_ids_list = []
+        colors_list = []
+        
+        for anchor in self.anchors:
+            # Each anchor creates k Gaussians with same object_id and color
+            object_ids_list.extend([anchor.object_id] * self.k)
+            for _ in range(self.k):
+                colors_list.append(anchor.color)
+        
+        self.register_buffer(
+            '_anchor_object_ids',
+            torch.tensor(object_ids_list, dtype=torch.long)
+        )
+        self.register_buffer(
+            '_anchor_colors',
+            torch.stack(colors_list)
+        )
     
     def to(self, device):
         """Override to track device"""
@@ -207,7 +247,7 @@ class ObjectGSModel(nn.Module):
     def _create_anchors_from_pointcloud(self, points, colors, object_ids):
         """Voxelize point cloud and create one anchor per voxel"""
         
-        # Compute voxel indices for each point
+        # Compute voxel indices
         voxel_indices = np.floor(points / self.voxel_size).astype(np.int32)
         
         # Group points by voxel
@@ -224,18 +264,18 @@ class ObjectGSModel(nn.Module):
             voxel_dict[key]['colors'].append(colors[i])
             voxel_dict[key]['object_ids'].append(object_ids[i])
         
-        # Create one anchor per voxel
+        # Create anchors
         anchors = []
         for voxel_idx, data in voxel_dict.items():
-            # Voxel center
             voxel_center = (np.array(voxel_idx) + 0.5) * self.voxel_size
-            
-            # Object ID: majority vote from points in voxel
             object_id = int(np.bincount(data['object_ids']).argmax())
             
-            # Create anchor
+            # Average color in this voxel
+            avg_color = np.mean(data['colors'], axis=0)
+            
             anchor = Anchor(
                 position=voxel_center,
+                color=avg_color,
                 object_id=object_id,
                 k=self.k,
                 feature_dim=self.feature_dim
@@ -245,78 +285,50 @@ class ObjectGSModel(nn.Module):
         
         return nn.ModuleList(anchors)
     
-    def generate_gaussians(self):
-        """
-        Generate all Gaussians from all anchors
-        
-        Returns:
-            List of Gaussian objects
-        """
-        all_gaussians = []
-        
-        for anchor in self.anchors:
-            # Get positions for k Gaussians
-            positions = anchor.get_gaussian_positions()  # [k, 3]
-            
-            # Generate attributes using MLP
-            opacity_raw, scale_raw, rotation, color = self.attribute_mlp(
-                anchor.feature
-            )
-            
-            # Create k Gaussians
-            for i in range(self.k):
-                gaussian = Gaussian(
-                    position=positions[i],
-                    opacity_raw=opacity_raw[i],
-                    scale_raw=scale_raw[i],
-                    rotation=rotation[i],
-                    color=color[i],
-                    object_id=anchor.object_id,
-                    num_objects=self.num_objects
-                )
-                all_gaussians.append(gaussian)
-        
-        return all_gaussians
-    
     def get_parameters_as_tensors(self):
         """
-        Export all Gaussian parameters as tensors (for rendering/saving)
-        
-        Returns:
-            dict with keys:
-                pos: [N, 3] - positions
-                opacity_raw: [N, 1] - raw opacity
-                scale_raw: [N, 3] - raw scale
-                rotation: [N, 4] - quaternions
-                color: [N, 3] - RGB colors
-                object_ids: [N] - object IDs
-                semantics: [N, num_objects] - one-hot encodings
-                num_gaussians: int
-                num_anchors: int
-                num_objects: int
+        Export all Gaussian parameters as tensors
+        OPTIMIZED: Zero Python loops
         """
-        gaussians = self.generate_gaussians()
+        num_anchors = len(self.anchors)
         
-        N = len(gaussians)
+        # Stack all anchor parameters
+        anchor_features = torch.stack([a.feature for a in self.anchors])
+        anchor_positions = torch.stack([a.position for a in self.anchors])
+        anchor_offsets = torch.stack([a.offsets for a in self.anchors])
+        anchor_scalings = torch.stack([a.scaling for a in self.anchors])
         
-        pos = torch.stack([g.position for g in gaussians])  # [N, 3]
-        opacity_raw = torch.stack([g.opacity_raw for g in gaussians]).unsqueeze(1)  # [N, 1]
-        scale_raw = torch.stack([g.scale_raw for g in gaussians])  # [N, 3]
-        rotation = torch.stack([g.rotation for g in gaussians])  # [N, 4]
-        color = torch.stack([g.color for g in gaussians])  # [N, 3]
-        object_ids = torch.tensor([g.object_id for g in gaussians], dtype=torch.long)  # [N]
-        semantics = torch.stack([g.semantic for g in gaussians])  # [N, num_objects]
+        # Compute positions
+        positions = anchor_positions.unsqueeze(1) + anchor_offsets * anchor_scalings.unsqueeze(1).unsqueeze(2)
+        positions = positions.reshape(-1, 3)
+        
+        # Run MLP
+        opacity_raw, scale_raw, rotation, color_delta = self.attribute_mlp(anchor_features)
+        
+        # Flatten
+        opacity_raw = opacity_raw.reshape(-1, 1)
+        scale_raw = scale_raw.reshape(-1, 3)
+        rotation = rotation.reshape(-1, 4)
+        color_delta = color_delta.reshape(-1, 3)
+        
+        # Use anchor colors as base, MLP provides small corrections
+        color = self._anchor_colors + (color_delta - 0.5) * 0.2
+        color = torch.clamp(color, 0, 1)
+        
+        # Object IDs and semantics
+        object_ids = self._anchor_object_ids
+        semantics = F.one_hot(object_ids, num_classes=self.num_objects).float()
         
         return {
-            'pos': pos.to(self.device),
-            'opacity_raw': opacity_raw.to(self.device),
-            'scale_raw': scale_raw.to(self.device),
-            'rotation': rotation.to(self.device),
-            'color': color.to(self.device),
-            'object_ids': object_ids.to(self.device),
-            'semantics': semantics.to(self.device),
-            'num_gaussians': N,
-            'num_anchors': len(self.anchors),
+            'pos': positions,
+            'opacity_raw': opacity_raw,
+            'scale_raw': scale_raw,
+            'rotation': rotation,
+            'color': color,
+            'object_ids': object_ids,
+            'semantics': semantics,
+            'num_gaussians': positions.shape[0],
+            'num_anchors': num_anchors,
             'num_objects': self.num_objects
         }
     
@@ -349,12 +361,26 @@ class ObjectGSModel(nn.Module):
         print(f"Voxel size:       {self.voxel_size}m")
         print(f"Feature dim:      {self.feature_dim}")
         print("-"*60)
-        print(f"Position:         {params['pos'].shape}")
-        print(f"Opacity:          {params['opacity_raw'].shape}")
-        print(f"Scale:            {params['scale_raw'].shape}")
-        print(f"Rotation:         {params['rotation'].shape}")
-        print(f"Color:            {params['color'].shape}")
-        print(f"Semantics:        {params['semantics'].shape}")
+        
+        # Check actual parameter ranges
+        opacity = torch.sigmoid(params['opacity_raw'])
+        scale = torch.exp(params['scale_raw'])
+        
+        print(f"Opacity range:    [{opacity.min():.3f}, {opacity.max():.3f}] (mean: {opacity.mean():.3f})")
+        print(f"Scale range:      [{scale.min():.4f}, {scale.max():.4f}] (mean: {scale.mean():.4f})")
+        print(f"Color range:      [{params['color'].min():.3f}, {params['color'].max():.3f}]")
+        
+        # Verify initialization
+        if opacity.mean() < 0.3:
+            print("\n✓ GOOD: Opacities start LOW (will increase during training)")
+        else:
+            print("\n⚠ WARNING: Opacities start HIGH (may cause blob formation)")
+        
+        if scale.mean() < 0.05:
+            print("✓ GOOD: Scales start SMALL")
+        else:
+            print("⚠ WARNING: Scales start LARGE")
+        
         print("="*60 + "\n")
 
 
@@ -362,16 +388,6 @@ def initialize_from_pointcloud(point_cloud, colors, object_ids=None,
                                voxel_size=0.02, k=10):
     """
     Convenience function to create ObjectGS model from point cloud
-    
-    Args:
-        point_cloud: [N, 3] numpy array
-        colors: [N, 3] numpy array [0, 1]
-        object_ids: [N] numpy array (or None for all 1s)
-        voxel_size: float - voxel size in meters
-        k: int - Gaussians per anchor
-        
-    Returns:
-        ObjectGSModel instance
     """
     model = ObjectGSModel(
         point_cloud=point_cloud,

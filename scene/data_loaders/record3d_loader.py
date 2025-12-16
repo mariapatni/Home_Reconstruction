@@ -162,6 +162,23 @@ class Record3DCamera:
         P[2, 3] = -(2.0 * zfar * znear) / (zfar - znear)
         
         return P.transpose(0, 1)
+    
+    def get_opencv_viewmat(self):
+        """Convert camera from OpenGL to OpenCV convention for gsplat"""
+        # OpenGL -> OpenCV conversion matrix
+        # Flips Y and Z axes
+        gl_to_cv = torch.tensor([
+            [1,  0,  0, 0],
+            [0, -1,  0, 0],
+            [0,  0, -1, 0],
+            [0,  0,  0, 1]
+        ], dtype=torch.float32, device=self.c2w.device)
+        
+        # Convert camera pose to OpenCV
+        c2w_cv = self.c2w @ gl_to_cv
+        w2c_cv = torch.inverse(c2w_cv)
+        
+        return w2c_cv.transpose(0, 1)
 
 
 def load_record3d_metadata(scene_path):
