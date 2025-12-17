@@ -1,46 +1,85 @@
 """
 ObjectGS: Anchor-based Gaussian Splatting with Object Awareness
-FIXED VERSION - Proper opacity initialization for stable training
 
-Key fixes:
-1. Initialize opacities LOW (inverse_sigmoid(0.1) ≈ -2.2) NOT HIGH!
-2. Better color preservation
-3. Smaller initial scales
+FIXES APPLIED:
+1. Color delta scale: 0.2 → 1.0 (line ~380)
+2. Color MLP weight init: 0.01 → 0.1 (line ~200)
+3. Opacity init: sigmoid(-2.2) ≈ 0.1 (line ~190)
+4. Scale init: exp(-4) ≈ 0.018 (line ~185)
+
+LOGGING: Comprehensive logging of all parameter statistics
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from scipy.spatial import cKDTree
+import logging
+import os
+from datetime import datetime
 
 
-class Gaussian:
-    """Individual 3D Gaussian primitive"""
-    
-    def __init__(self, position, opacity_raw, scale_raw, rotation, 
-                 color, object_id, num_objects):
-        self.position = position
-        self.opacity_raw = opacity_raw
-        self.scale_raw = scale_raw
-        self.rotation = rotation
-        self.color = color
-        self.object_id = object_id
-        self.semantic = self._create_one_hot(object_id, num_objects)
-    
-    def _create_one_hot(self, object_id, num_objects):
-        one_hot = torch.zeros(num_objects)
-        one_hot[object_id] = 1.0
-        return one_hot
-    
-    @property
-    def opacity(self):
-        return torch.sigmoid(self.opacity_raw).clamp(0, 0.999)
-    
-    @property
-    def scale(self):
-        return torch.exp(self.scale_raw).clamp_min(1e-6)
+# =============================================================================
+# LOGGING SETUP
+# =============================================================================
 
+_LOGGER = None
+_LOG_DIR = '/workspace/Home_Reconstruction/outputs'
+
+
+def get_logger():
+    """Get or create the shared logger"""
+    global _LOGGER
+    if _LOGGER is None:
+        _LOGGER = setup_logger()
+    return _LOGGER
+
+
+def setup_logger(log_dir=None):
+    """Setup logger for model and training diagnostics"""
+    global _LOG_DIR, _LOGGER
+    if log_dir:
+        _LOG_DIR = log_dir
+    
+    os.makedirs(_LOG_DIR, exist_ok=True)
+    
+    logger = logging.getLogger('ObjectGS')
+    logger.setLevel(logging.DEBUG)
+    
+    # Clear existing handlers
+    if logger.handlers:
+        logger.handlers.clear()
+    
+    # File handler - captures everything
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(_LOG_DIR, f'objectgs_training_{timestamp}.log')
+    fh = logging.FileHandler(log_file)
+    fh.setLevel(logging.DEBUG)
+    
+    # Console handler - info and above
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    
+    # Formatter
+    formatter = logging.Formatter('%(asctime)s | %(levelname)-7s | %(message)s', 
+                                  datefmt='%H:%M:%S')
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+    
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    
+    logger.info("="*70)
+    logger.info(f"LOG FILE: {log_file}")
+    logger.info("="*70)
+    
+    _LOGGER = logger
+    return logger
+
+
+# =============================================================================
+# ANCHOR CLASS
+# =============================================================================
 
 class Anchor(nn.Module):
     """Anchor point that generates k neural Gaussians"""
@@ -48,34 +87,27 @@ class Anchor(nn.Module):
     def __init__(self, position, color, object_id, k=10, feature_dim=32):
         super().__init__()
         
-        # Register position as buffer
         self.register_buffer('position', torch.tensor(position, dtype=torch.float32))
-        
-        # Store anchor color for initialization
         self.register_buffer('color', torch.tensor(color, dtype=torch.float32))
         
         self.object_id = object_id
         self.k = k
         
         # Learnable parameters
-        # Initialize feature to encode the color
         feature_init = torch.randn(feature_dim) * 0.1
-        feature_init[:3] = torch.tensor(color, dtype=torch.float32)  # First 3 dims = color
+        feature_init[:3] = torch.tensor(color, dtype=torch.float32)
         self.feature = nn.Parameter(feature_init)
         
         self.scaling = nn.Parameter(torch.tensor(1.0))
         self.offsets = nn.Parameter(torch.randn(k, 3) * 0.01)
         
     def get_gaussian_positions(self):
-        positions = self.position.unsqueeze(0) + self.offsets * self.scaling
-        return positions
+        return self.position.unsqueeze(0) + self.offsets * self.scaling
 
 
-def inverse_sigmoid(x):
-    """Compute inverse sigmoid (logit)"""
-    x = torch.clamp(x, 1e-6, 1 - 1e-6)
-    return torch.log(x / (1 - x))
-
+# =============================================================================
+# ATTRIBUTE MLP
+# =============================================================================
 
 class AttributeMLP(nn.Module):
     """MLP to generate Gaussian attributes from anchor features"""
@@ -83,6 +115,7 @@ class AttributeMLP(nn.Module):
     def __init__(self, feature_dim=32, k=10):
         super().__init__()
         self.k = k
+        self.feature_dim = feature_dim
         
         self.opacity_mlp = nn.Sequential(
             nn.Linear(feature_dim, 64),
@@ -112,197 +145,248 @@ class AttributeMLP(nn.Module):
         """
         Args:
             anchor_feature: [N, F] batched anchor features
-            
         Returns:
-            opacity_raw: [N, k]
-            scale_raw: [N, k, 3]
-            rotation: [N, k, 4]
-            color: [N, k, 3]
+            opacity_raw, scale_raw, rotation, color_delta
         """
         batch_size = anchor_feature.shape[0]
         
-        opacity_raw = self.opacity_mlp(anchor_feature)  # [N, k]
+        opacity_raw = self.opacity_mlp(anchor_feature)
         
         scale_raw = self.scale_mlp(anchor_feature)
-        scale_raw = scale_raw.reshape(batch_size, self.k, 3)  # [N, k, 3]
+        scale_raw = scale_raw.reshape(batch_size, self.k, 3)
         
         rotation = self.rotation_mlp(anchor_feature)
-        rotation = rotation.reshape(batch_size, self.k, 4)  # [N, k, 4]
+        rotation = rotation.reshape(batch_size, self.k, 4)
         rotation = rotation / (rotation.norm(dim=-1, keepdim=True) + 1e-9)
         
         color = self.color_mlp(anchor_feature)
-        color = color.reshape(batch_size, self.k, 3)  # [N, k, 3]
-        
-        # Use tanh to allow full color range, then scale to [0, 1]
-        color = torch.tanh(color) * 0.5 + 0.5
+        color = color.reshape(batch_size, self.k, 3)
+        color = torch.tanh(color) * 0.5 + 0.5  # Map to [0, 1]
         
         return opacity_raw, scale_raw, rotation, color
+    
+    def get_weight_stats(self):
+        """Return dictionary of weight statistics for logging"""
+        stats = {}
+        for name, mlp in [('opacity', self.opacity_mlp), 
+                          ('scale', self.scale_mlp),
+                          ('rotation', self.rotation_mlp),
+                          ('color', self.color_mlp)]:
+            for i, layer in enumerate(mlp):
+                if hasattr(layer, 'weight'):
+                    w = layer.weight.data
+                    stats[f'{name}_L{i}_w_mean'] = w.mean().item()
+                    stats[f'{name}_L{i}_w_std'] = w.std().item()
+                    stats[f'{name}_L{i}_w_absmax'] = w.abs().max().item()
+                if hasattr(layer, 'bias') and layer.bias is not None:
+                    b = layer.bias.data
+                    stats[f'{name}_L{i}_b_mean'] = b.mean().item()
+                    stats[f'{name}_L{i}_b_std'] = b.std().item()
+        return stats
+    
+    def get_gradient_stats(self):
+        """Return gradient statistics for logging"""
+        stats = {}
+        for name, mlp in [('opacity', self.opacity_mlp), 
+                          ('scale', self.scale_mlp),
+                          ('rotation', self.rotation_mlp),
+                          ('color', self.color_mlp)]:
+            for i, layer in enumerate(mlp):
+                if hasattr(layer, 'weight') and layer.weight.grad is not None:
+                    g = layer.weight.grad
+                    stats[f'{name}_L{i}_w_grad_mean'] = g.mean().item()
+                    stats[f'{name}_L{i}_w_grad_std'] = g.std().item()
+                    stats[f'{name}_L{i}_w_grad_absmax'] = g.abs().max().item()
+                if hasattr(layer, 'bias') and layer.bias is not None and layer.bias.grad is not None:
+                    g = layer.bias.grad
+                    stats[f'{name}_L{i}_b_grad_mean'] = g.mean().item()
+        return stats
 
+
+# =============================================================================
+# MAIN MODEL
+# =============================================================================
 
 class ObjectGSModel(nn.Module):
-    """Main ObjectGS model with FIXED initialization"""
+    """
+    ObjectGS Model with ALL FIXES APPLIED
+    """
     
     def __init__(self, point_cloud, colors, object_ids=None, 
                  voxel_size=0.02, k=10, feature_dim=32):
         super().__init__()
         
+        self.logger = get_logger()
         self.k = k
         self.feature_dim = feature_dim
         self.voxel_size = voxel_size
+        self._call_count = 0
         
         if object_ids is None:
             object_ids = np.ones(len(point_cloud), dtype=np.int32)
         
         self.num_objects = int(object_ids.max()) + 1
         
-        print(f"\n{'='*60}")
-        print("Initializing ObjectGS model (FIXED VERSION)")
-        print(f"{'='*60}")
-        print(f"  Point cloud: {len(point_cloud):,} points")
-        print(f"  Voxel size: {voxel_size}m")
-        print(f"  Gaussians per anchor: {k}")
-        print(f"  Number of objects: {self.num_objects}")
+        # Log initialization
+        self.logger.info("="*70)
+        self.logger.info("INITIALIZING ObjectGSModel")
+        self.logger.info("="*70)
+        self.logger.info(f"Input points: {len(point_cloud):,}")
+        self.logger.info(f"Voxel size: {voxel_size}")
+        self.logger.info(f"k (Gaussians/anchor): {k}")
+        self.logger.info(f"Feature dim: {feature_dim}")
         
-        # Create anchors from voxelized point cloud
-        self.anchors = self._create_anchors_from_pointcloud(
-            point_cloud, colors, object_ids
-        )
+        # Log input statistics
+        self.logger.info(f"Point cloud bounds:")
+        self.logger.info(f"  X: [{point_cloud[:,0].min():.3f}, {point_cloud[:,0].max():.3f}]")
+        self.logger.info(f"  Y: [{point_cloud[:,1].min():.3f}, {point_cloud[:,1].max():.3f}]")
+        self.logger.info(f"  Z: [{point_cloud[:,2].min():.3f}, {point_cloud[:,2].max():.3f}]")
+        self.logger.info(f"Input colors - mean: {colors.mean():.4f}, std: {colors.std():.4f}")
+        self.logger.info(f"Input colors - R: {colors[:,0].mean():.3f}, G: {colors[:,1].mean():.3f}, B: {colors[:,2].mean():.3f}")
         
-        print(f"  Created {len(self.anchors)} anchors")
-        print(f"  Total Gaussians: {len(self.anchors) * k:,}")
+        # Create anchors
+        self.anchors = self._create_anchors(point_cloud, colors, object_ids)
+        self.logger.info(f"Created {len(self.anchors)} anchors → {len(self.anchors) * k:,} Gaussians")
         
-        # MLP for generating Gaussian attributes
+        # Create MLP
         self.attribute_mlp = AttributeMLP(feature_dim=feature_dim, k=k)
         
-        # CRITICAL FIX: Initialize MLPs properly for STABLE training
-        with torch.no_grad():
-            # 1. Scale MLP: SMALL initial scales (exp(-4) ≈ 0.018)
-            # Start smaller than before to prevent immediate bloating
-            scale_output = self.attribute_mlp.scale_mlp[-1]
-            if hasattr(scale_output, 'bias') and scale_output.bias is not None:
-                scale_output.bias.data.fill_(-4.0)  # Smaller than before
-            if hasattr(scale_output, 'weight'):
-                scale_output.weight.data *= 0.1  # Small weights
-                print("  ✓ Initialized scales to SMALL (~0.018)")
-            
-            # 2. Opacity MLP: LOW initial opacity (inverse_sigmoid(0.1) ≈ -2.2)
-            # THIS IS THE KEY FIX! Start with low opacity, let it grow during training
-            opacity_output = self.attribute_mlp.opacity_mlp[-1]
-            if hasattr(opacity_output, 'bias') and opacity_output.bias is not None:
-                # inverse_sigmoid(0.1) ≈ -2.197
-                opacity_output.bias.data.fill_(-2.2)
-                print("  ✓ Initialized opacities to LOW (0.1) - KEY FIX!")
-            if hasattr(opacity_output, 'weight'):
-                opacity_output.weight.data *= 0.1  # Small weights
-            
-            # 3. Color MLP: preserve point cloud colors
-            color_output = self.attribute_mlp.color_mlp[-1]
-            if hasattr(color_output, 'weight'):
-                color_output.weight.data *= 0.01  # Very small weights
-            if hasattr(color_output, 'bias') and color_output.bias is not None:
-                color_output.bias.data.zero_()
-                print("  ✓ Initialized colors to preserve point cloud colors")
-            
-            # 4. Rotation MLP: initialize to identity quaternion [0,0,0,1]
-            rotation_output = self.attribute_mlp.rotation_mlp[-1]
-            if hasattr(rotation_output, 'bias') and rotation_output.bias is not None:
-                rotation_output.bias.data.zero_()
-                # Set every 4th element (w component) to 1
-                rotation_output.bias.data[3::4] = 1.0
+        # =====================================================================
+        # FIXED MLP INITIALIZATION
+        # =====================================================================
+        self.logger.info("-"*50)
+        self.logger.info("APPLYING FIXED MLP INITIALIZATION")
+        self.logger.info("-"*50)
         
-        # Device tracking
-        self.device = torch.device('cpu')
+        with torch.no_grad():
+            # Scale: exp(-4) ≈ 0.018
+            scale_out = self.attribute_mlp.scale_mlp[-1]
+            scale_out.bias.data.fill_(-4.0)
+            scale_out.weight.data *= 0.1
+            self.logger.info(f"Scale: bias=-4.0 (exp=->{np.exp(-4):.4f}), weights*=0.1")
+            
+            # Opacity: sigmoid(-2.2) ≈ 0.10
+            opacity_out = self.attribute_mlp.opacity_mlp[-1]
+            opacity_out.bias.data.fill_(-2.2)
+            opacity_out.weight.data *= 0.1
+            self.logger.info(f"Opacity: bias=-2.2 (sig=->{1/(1+np.exp(2.2)):.4f}), weights*=0.1")
+            
+            # Color: FIXED - weights *= 0.1 (was 0.01)
+            color_out = self.attribute_mlp.color_mlp[-1]
+            color_out.weight.data *= 2.0  # FIX: was 0.01
+            color_out.bias.data.zero_()
+            self.logger.info(f"Color: weights*=2.0), bias=0")
+            
+            # Rotation: identity quaternion
+            rot_out = self.attribute_mlp.rotation_mlp[-1]
+            rot_out.bias.data.zero_()
+            rot_out.bias.data[3::4] = 1.0
+            self.logger.info(f"Rotation: identity quaternion [0,0,0,1]")
         
         # Pre-compute anchor data
         self._precompute_anchor_data()
         
-        print(f"  ✓ Pre-computed anchor data")
-        print(f"{'='*60}\n")
-    
-    def _precompute_anchor_data(self):
-        """Pre-compute anchor object IDs and colors as tensors"""
-        object_ids_list = []
-        colors_list = []
+        # Log anchor color statistics
+        ac = self._anchor_colors.cpu().numpy()
+        self.logger.info(f"Anchor colors - mean: {ac.mean():.4f}, std: {ac.std():.4f}")
+        self.logger.info(f"Anchor colors - R: {ac[:,0].mean():.3f}±{ac[:,0].std():.3f}")
+        self.logger.info(f"Anchor colors - G: {ac[:,1].mean():.3f}±{ac[:,1].std():.3f}")
+        self.logger.info(f"Anchor colors - B: {ac[:,2].mean():.3f}±{ac[:,2].std():.3f}")
         
-        for anchor in self.anchors:
-            # Each anchor creates k Gaussians with same object_id and color
-            object_ids_list.extend([anchor.object_id] * self.k)
-            for _ in range(self.k):
-                colors_list.append(anchor.color)
+        # Log initial MLP weights
+        self._log_mlp_weights("INIT")
         
-        self.register_buffer(
-            '_anchor_object_ids',
-            torch.tensor(object_ids_list, dtype=torch.long)
-        )
-        self.register_buffer(
-            '_anchor_colors',
-            torch.stack(colors_list)
-        )
+        self.device = torch.device('cpu')
+        self.logger.info("="*70)
     
-    def to(self, device):
-        """Override to track device"""
-        self.device = device
-        return super().to(device)
-    
-    def _create_anchors_from_pointcloud(self, points, colors, object_ids):
-        """Voxelize point cloud and create one anchor per voxel"""
-        
-        # Compute voxel indices
+    def _create_anchors(self, points, colors, object_ids):
+        """Voxelize and create anchors"""
         voxel_indices = np.floor(points / self.voxel_size).astype(np.int32)
         
-        # Group points by voxel
         voxel_dict = {}
-        for i, voxel_idx in enumerate(voxel_indices):
-            key = tuple(voxel_idx)
+        for i, vidx in enumerate(voxel_indices):
+            key = tuple(vidx)
             if key not in voxel_dict:
-                voxel_dict[key] = {
-                    'points': [],
-                    'colors': [],
-                    'object_ids': []
-                }
-            voxel_dict[key]['points'].append(points[i])
+                voxel_dict[key] = {'colors': [], 'object_ids': []}
             voxel_dict[key]['colors'].append(colors[i])
             voxel_dict[key]['object_ids'].append(object_ids[i])
         
-        # Create anchors
+        # Log voxelization stats
+        pts_per_voxel = [len(v['colors']) for v in voxel_dict.values()]
+        self.logger.info(f"Voxelization: {len(voxel_dict)} voxels, "
+                        f"pts/voxel: {np.mean(pts_per_voxel):.1f}±{np.std(pts_per_voxel):.1f}")
+        
         anchors = []
-        for voxel_idx, data in voxel_dict.items():
-            voxel_center = (np.array(voxel_idx) + 0.5) * self.voxel_size
-            object_id = int(np.bincount(data['object_ids']).argmax())
-            
-            # Average color in this voxel
+        for vidx, data in voxel_dict.items():
+            pos = (np.array(vidx) + 0.5) * self.voxel_size
+            obj_id = int(np.bincount(data['object_ids']).argmax())
             avg_color = np.mean(data['colors'], axis=0)
             
-            anchor = Anchor(
-                position=voxel_center,
-                color=avg_color,
-                object_id=object_id,
-                k=self.k,
-                feature_dim=self.feature_dim
-            )
-            
-            anchors.append(anchor)
+            anchors.append(Anchor(
+                position=pos, color=avg_color, object_id=obj_id,
+                k=self.k, feature_dim=self.feature_dim
+            ))
         
         return nn.ModuleList(anchors)
     
+    def _precompute_anchor_data(self):
+        """Pre-compute anchor colors and object IDs"""
+        obj_ids = []
+        colors = []
+        for anchor in self.anchors:
+            obj_ids.extend([anchor.object_id] * self.k)
+            colors.extend([anchor.color] * self.k)
+        
+        self.register_buffer('_anchor_object_ids', torch.tensor(obj_ids, dtype=torch.long))
+        self.register_buffer('_anchor_colors', torch.stack(colors))
+    
+    def to(self, device):
+        self.device = device
+        return super().to(device)
+    
+    def _log_mlp_weights(self, prefix):
+        """Log MLP weight statistics"""
+        stats = self.attribute_mlp.get_weight_stats()
+        self.logger.debug(f"[{prefix}] MLP Weight Stats:")
+        for key in ['opacity', 'scale', 'color', 'rotation']:
+            w_mean = stats.get(f'{key}_L2_w_mean', 0)
+            w_std = stats.get(f'{key}_L2_w_std', 0)
+            b_mean = stats.get(f'{key}_L2_b_mean', 0)
+            self.logger.debug(f"  {key:8s} out: w={w_mean:+.5f}±{w_std:.5f}, b={b_mean:+.4f}")
+    
+    def _log_mlp_gradients(self, prefix):
+        """Log MLP gradient statistics"""
+        stats = self.attribute_mlp.get_gradient_stats()
+        if stats:
+            self.logger.debug(f"[{prefix}] MLP Gradient Stats:")
+            for key in ['opacity', 'scale', 'color', 'rotation']:
+                g_mean = stats.get(f'{key}_L2_w_grad_mean', 0)
+                g_std = stats.get(f'{key}_L2_w_grad_std', 0)
+                g_max = stats.get(f'{key}_L2_w_grad_absmax', 0)
+                if g_max > 0:
+                    self.logger.debug(f"  {key:8s} grad: mean={g_mean:+.6f}, std={g_std:.6f}, max={g_max:.6f}")
+    
     def get_parameters_as_tensors(self):
         """
-        Export all Gaussian parameters as tensors
-        OPTIMIZED: Zero Python loops
+        Get all Gaussian parameters
+        
+        FIX APPLIED: Color delta scale 0.2 → 1.0
         """
+        self._call_count += 1
+        
         num_anchors = len(self.anchors)
         
-        # Stack all anchor parameters
+        # Stack anchor parameters
         anchor_features = torch.stack([a.feature for a in self.anchors])
         anchor_positions = torch.stack([a.position for a in self.anchors])
         anchor_offsets = torch.stack([a.offsets for a in self.anchors])
         anchor_scalings = torch.stack([a.scaling for a in self.anchors])
         
-        # Compute positions
+        # Positions
         positions = anchor_positions.unsqueeze(1) + anchor_offsets * anchor_scalings.unsqueeze(1).unsqueeze(2)
         positions = positions.reshape(-1, 3)
         
-        # Run MLP
+        # MLP forward
         opacity_raw, scale_raw, rotation, color_delta = self.attribute_mlp(anchor_features)
         
         # Flatten
@@ -311,11 +395,15 @@ class ObjectGSModel(nn.Module):
         rotation = rotation.reshape(-1, 4)
         color_delta = color_delta.reshape(-1, 3)
         
-        # Use anchor colors as base, MLP provides small corrections
-        color = self._anchor_colors + (color_delta - 0.5) * 0.2
+        # =====================================================================
+        # FIX: Color delta scale 0.2 → 1.0
+        # =====================================================================
+        # OLD: color = self._anchor_colors + (color_delta - 0.5) * 0.2
+        # NEW:
+        color = self._anchor_colors + (color_delta - 0.5) * 1.0
         color = torch.clamp(color, 0, 1)
         
-        # Object IDs and semantics
+        # Object IDs
         object_ids = self._anchor_object_ids
         semantics = F.one_hot(object_ids, num_classes=self.num_objects).float()
         
@@ -325,6 +413,9 @@ class ObjectGSModel(nn.Module):
             'scale_raw': scale_raw,
             'rotation': rotation,
             'color': color,
+            'color_delta': color_delta,
+            'anchor_colors': self._anchor_colors,
+            'anchor_features': anchor_features,
             'object_ids': object_ids,
             'semantics': semantics,
             'num_gaussians': positions.shape[0],
@@ -332,12 +423,55 @@ class ObjectGSModel(nn.Module):
             'num_objects': self.num_objects
         }
     
+    def get_param_stats(self):
+        """Get parameter statistics for logging"""
+        with torch.no_grad():
+            params = self.get_parameters_as_tensors()
+            
+            opacity = torch.sigmoid(params['opacity_raw']).squeeze()
+            scale = torch.exp(params['scale_raw'])
+            color = params['color']
+            color_delta = params['color_delta']
+            anchor_features = params['anchor_features']
+            
+            return {
+                'opacity_mean': opacity.mean().item(),
+                'opacity_std': opacity.std().item(),
+                'opacity_min': opacity.min().item(),
+                'opacity_max': opacity.max().item(),
+                'scale_mean': scale.mean().item(),
+                'scale_std': scale.std().item(),
+                'scale_min': scale.min().item(),
+                'scale_max': scale.max().item(),
+                'color_mean': color.mean().item(),
+                'color_std': color.std().item(),
+                'color_r_mean': color[:,0].mean().item(),
+                'color_g_mean': color[:,1].mean().item(),
+                'color_b_mean': color[:,2].mean().item(),
+                'color_delta_mean': color_delta.mean().item(),
+                'color_delta_std': color_delta.std().item(),
+                'anchor_feat_mean': anchor_features.mean().item(),
+                'anchor_feat_std': anchor_features.std().item(),
+            }
+    
+    def log_state(self, prefix="", level="info"):
+        """Log current model state"""
+        stats = self.get_param_stats()
+        log_fn = self.logger.info if level == "info" else self.logger.debug
+        log_fn(f"{prefix}Opacity: {stats['opacity_mean']:.4f}±{stats['opacity_std']:.4f} "
+               f"[{stats['opacity_min']:.4f}, {stats['opacity_max']:.4f}]")
+        log_fn(f"{prefix}Scale:   {stats['scale_mean']:.4f}±{stats['scale_std']:.4f} "
+               f"[{stats['scale_min']:.4f}, {stats['scale_max']:.4f}]")
+        log_fn(f"{prefix}Color:   {stats['color_mean']:.4f}±{stats['color_std']:.4f} "
+               f"RGB=({stats['color_r_mean']:.3f},{stats['color_g_mean']:.3f},{stats['color_b_mean']:.3f})")
+        log_fn(f"{prefix}ColorΔ:  {stats['color_delta_mean']:.4f}±{stats['color_delta_std']:.4f}")
+        log_fn(f"{prefix}AnchorF: {stats['anchor_feat_mean']:.4f}±{stats['anchor_feat_std']:.4f}")
+        return stats
+    
     def save(self, path):
-        """Save model parameters"""
-        params = self.get_parameters_as_tensors()
+        """Save model"""
         torch.save({
             'state_dict': self.state_dict(),
-            'params': params,
             'config': {
                 'voxel_size': self.voxel_size,
                 'k': self.k,
@@ -345,58 +479,4 @@ class ObjectGSModel(nn.Module):
                 'num_objects': self.num_objects
             }
         }, path)
-        print(f"Saved model to {path}")
-    
-    def summary(self):
-        """Print model summary"""
-        params = self.get_parameters_as_tensors()
-        
-        print("\n" + "="*60)
-        print("ObjectGS Model Summary")
-        print("="*60)
-        print(f"Anchors:          {params['num_anchors']:,}")
-        print(f"Gaussians:        {params['num_gaussians']:,}")
-        print(f"Objects:          {params['num_objects']}")
-        print(f"Gaussians/Anchor: {self.k}")
-        print(f"Voxel size:       {self.voxel_size}m")
-        print(f"Feature dim:      {self.feature_dim}")
-        print("-"*60)
-        
-        # Check actual parameter ranges
-        opacity = torch.sigmoid(params['opacity_raw'])
-        scale = torch.exp(params['scale_raw'])
-        
-        print(f"Opacity range:    [{opacity.min():.3f}, {opacity.max():.3f}] (mean: {opacity.mean():.3f})")
-        print(f"Scale range:      [{scale.min():.4f}, {scale.max():.4f}] (mean: {scale.mean():.4f})")
-        print(f"Color range:      [{params['color'].min():.3f}, {params['color'].max():.3f}]")
-        
-        # Verify initialization
-        if opacity.mean() < 0.3:
-            print("\n✓ GOOD: Opacities start LOW (will increase during training)")
-        else:
-            print("\n⚠ WARNING: Opacities start HIGH (may cause blob formation)")
-        
-        if scale.mean() < 0.05:
-            print("✓ GOOD: Scales start SMALL")
-        else:
-            print("⚠ WARNING: Scales start LARGE")
-        
-        print("="*60 + "\n")
-
-
-def initialize_from_pointcloud(point_cloud, colors, object_ids=None,
-                               voxel_size=0.02, k=10):
-    """
-    Convenience function to create ObjectGS model from point cloud
-    """
-    model = ObjectGSModel(
-        point_cloud=point_cloud,
-        colors=colors,
-        object_ids=object_ids,
-        voxel_size=voxel_size,
-        k=k
-    )
-    
-    model.summary()
-    
-    return model
+        self.logger.info(f"Saved model to {path}")
