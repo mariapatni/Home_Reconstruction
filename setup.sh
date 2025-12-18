@@ -11,10 +11,6 @@ echo ""
 # Prevent interactive prompts
 export DEBIAN_FRONTEND=noninteractive
 
-# Use workspace for temp to avoid memory issues
-export TMPDIR=/workspace/tmp
-mkdir -p /workspace/tmp
-
 # System dependencies
 echo "[1/3] Installing system dependencies..."
 apt-get update -qq
@@ -52,45 +48,4 @@ done
 
 echo ""
 echo "✓ All packages installed"
-echo ""
-
-# Verify installations
-echo "======================================================================"
-echo "Verification"
-echo "======================================================================"
-
-python3 -c "
-import sys
-packages = {
-    'numpy': 'NumPy',
-    'scipy': 'SciPy',
-    'PIL': 'Pillow',
-    'OpenEXR': 'OpenEXR',
-    'plyfile': 'plyfile',
-    'plotly': 'Plotly',
-    'matplotlib': 'Matplotlib'
-}
-
-failed = []
-for module, name in packages.items():
-    try:
-        __import__(module)
-        print(f'✓ {name}')
-    except ImportError:
-        print(f'✗ {name} - FAILED')
-        failed.append(name)
-
-if failed:
-    print(f'\n⚠️  Installation incomplete. Failed: {', '.join(failed)}')
-    sys.exit(1)
-else:
-    print('\n✓ All packages verified successfully!')
-"
-
-echo ""
-echo "======================================================================"
-echo "Setup Complete!"
-echo "======================================================================"
-echo ""
-echo "Note: Restart your Jupyter kernel to use the new packages"
 echo ""

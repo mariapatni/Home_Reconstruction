@@ -178,7 +178,7 @@ class Record3DCamera:
         c2w_cv = self.c2w @ gl_to_cv
         w2c_cv = torch.inverse(c2w_cv)
         
-        return w2c_cv.transpose(0, 1)
+        return w2c_cv
 
 
 def load_record3d_metadata(scene_path):
