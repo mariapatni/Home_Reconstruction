@@ -57,6 +57,19 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
         points = np.asarray(pcd.points)
         colors = np.asarray(pcd.colors)
         
+        # Validate colors were read correctly
+        if colors.size == 0 or colors.shape[0] != points.shape[0]:
+            print(f"  ⚠ Warning: Open3D didn't read colors properly (shape: {colors.shape})")
+            print(f"  → Attempting manual PLY color extraction...")
+            colors = _extract_colors_from_ply(ply_path, len(points))
+        
+        # Final validation
+        if colors.size == 0 or colors.shape[0] != points.shape[0]:
+            print(f"  ⚠ Warning: Could not read colors, using default gray")
+            colors = np.ones((len(points), 3)) * 0.5
+        else:
+            print(f"  ✓ Colors loaded: range=[{colors.min():.3f}, {colors.max():.3f}], mean={colors.mean():.3f}")
+        
         print(f"  ✓ {len(points):,} points")
         
         point_clouds.append({
@@ -75,7 +88,9 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
         return points, colors
     
     def colors_to_rgb_strings(colors):
-        colors_rgb = (colors * 255).astype(int)
+        # Ensure colors are in [0, 1] range before scaling
+        colors_clipped = np.clip(colors, 0, 1)
+        colors_rgb = (colors_clipped * 255).astype(int)
         return [f'rgb({r},{g},{b})' for r, g, b in colors_rgb]
     
     # Prepare plot data
@@ -224,3 +239,72 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
         total = data['original_count']
         print(f"{data['name']:30s} {total:>10,} points ({displayed:>7,} displayed)")
     print(f"{'='*60}\n")
+
+
+def _extract_colors_from_ply(ply_path, num_points):
+    """
+    Manually extract colors from PLY file when Open3D fails.
+    Handles PLY files with custom properties between xyz and rgb.
+    """
+    ply_path = Path(ply_path)
+    
+    try:
+        with open(ply_path, 'r') as f:
+            lines = f.readlines()
+        
+        # Parse header to find property order
+        header_end = 0
+        properties = []
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if line == 'end_header':
+                header_end = i + 1
+                break
+            if line.startswith('property'):
+                parts = line.split()
+                if len(parts) >= 3:
+                    prop_type = parts[1]
+                    prop_name = parts[2]
+                    properties.append((prop_name, prop_type))
+        
+        # Find color property indices
+        prop_names = [p[0] for p in properties]
+        
+        try:
+            red_idx = prop_names.index('red')
+            green_idx = prop_names.index('green')
+            blue_idx = prop_names.index('blue')
+        except ValueError:
+            print(f"  → Could not find red/green/blue properties in PLY")
+            return np.array([])
+        
+        # Determine if colors are uchar (0-255) or float (0-1)
+        color_type = properties[red_idx][1]
+        is_uchar = color_type == 'uchar'
+        
+        # Parse data lines
+        colors = []
+        data_lines = lines[header_end:header_end + num_points]
+        
+        for line in data_lines:
+            values = line.strip().split()
+            if len(values) > max(red_idx, green_idx, blue_idx):
+                r = float(values[red_idx])
+                g = float(values[green_idx])
+                b = float(values[blue_idx])
+                
+                # Normalize to [0, 1] if uchar
+                if is_uchar:
+                    r, g, b = r / 255.0, g / 255.0, b / 255.0
+                
+                colors.append([r, g, b])
+        
+        colors = np.array(colors, dtype=np.float64)
+        print(f"  → Manual extraction successful: {len(colors)} colors")
+        
+        return colors
+        
+    except Exception as e:
+        print(f"  → Manual color extraction failed: {e}")
+        return np.array([])

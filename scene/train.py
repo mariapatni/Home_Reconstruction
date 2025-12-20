@@ -116,7 +116,7 @@ def setup_training_logger(run_manager: RunManager) -> logging.Logger:
         logger.handlers.clear()
     
     # File handler
-    fh = logging.FileHandler(run_manager.log_file)
+    fh = logging.FileHandler(run_manager.log_file, encoding='utf-8')
     fh.setLevel(logging.DEBUG)
     
     # Console handler
@@ -373,7 +373,7 @@ class GaussianTrainer:
         self.logger.info("-" * 50)
         
         pbar = tqdm(range(1, self.config['num_iterations'] + 1))
-        
+    
         for i in pbar:
             self.current_iteration = i
             
@@ -398,9 +398,9 @@ class GaussianTrainer:
                     f"SSIM={losses['ssim_val']:.3f} ScReg={losses['scale_reg']:.4f}"
                 )
             
-            # Test evaluation
+            # Test evaluation with 0.5 scale
             if i % self.config['test_interval'] == 0:
-                self.evaluate(i)
+                self.evaluate(i, scale=0.5)  # <-- Add scale parameter
             
             # Checkpoint
             if i % self.config['save_interval'] == 0:
@@ -413,15 +413,28 @@ class GaussianTrainer:
         self.logger.info("TRAINING COMPLETE")
         self.logger.info("=" * 70)
         
-        self.evaluate(self.config['num_iterations'], final=True)
+        self.evaluate(self.config['num_iterations'], final=True, scale=0.5)
         self.save_checkpoint(self.config['num_iterations'], final=True)
         self.save_training_history()
-        self.render_all_test_views()
+        
+        # Export everything automatically (includes PLY + grid)
+        self.export_final_outputs(
+            include_ply=True,
+            include_comparison_grid=True,
+            render_scale=0.5
+        )
         
         self.logger.info(f"All outputs saved to: {self.run_manager.run_dir}")
     
-    def evaluate(self, iteration, final=False):
-        """Evaluate on test set"""
+    def evaluate(self, iteration, final=False, scale=0.5):
+        """
+        Evaluate on test set
+        
+        Args:
+            iteration: Current iteration number
+            final: Whether this is final evaluation
+            scale: Scale factor for saved images (0.5 = half resolution)
+        """
         self.logger.info(f"[{iteration}] Evaluating...")
         
         self.model.eval()
@@ -438,6 +451,16 @@ class GaussianTrainer:
                 # Save first comparison
                 if cam_idx == 0:
                     comparison = torch.cat([rendered, gt], dim=2)
+                    
+                    # Apply scaling
+                    if scale != 1.0:
+                        comparison = F.interpolate(
+                            comparison.unsqueeze(0),
+                            scale_factor=scale,
+                            mode='bilinear',
+                            align_corners=False
+                        )[0]
+                    
                     if final:
                         save_path = self.run_manager.final_outputs_dir / f'final_comparison.png'
                     else:
@@ -489,6 +512,247 @@ class GaussianTrainer:
         
         self.logger.info(f"Saved history: {path}")
     
+    # Add these methods to the GaussianTrainer class
+
+    # =============================================================================
+    # CHECKPOINT LOADING AND EXPORT METHODS
+    # =============================================================================
+    
+    @staticmethod
+    def find_latest_checkpoint(checkpoint_dir):
+        """
+        Find the most recent checkpoint file in a directory.
+        
+        Args:
+            checkpoint_dir: Path to checkpoint directory
+            
+        Returns:
+            Path to latest checkpoint file
+        """
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoints = list(checkpoint_dir.glob('checkpoint_*.pth'))
+        
+        if not checkpoints:
+            raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
+        
+        # Sort by iteration number
+        checkpoints.sort(key=lambda p: int(p.stem.split('_')[-1]))
+        return checkpoints[-1]
+    
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path, model, scene, scene_name=None, 
+                        base_output_dir="/workspace/Home_Reconstruction/outputs"):
+        """
+        Create a trainer instance from a checkpoint.
+        
+        Args:
+            checkpoint_path: Path to checkpoint file
+            model: Model instance (will be loaded with checkpoint weights)
+            scene: Scene instance
+            scene_name: Optional scene name (extracted from checkpoint if not provided)
+            base_output_dir: Base output directory
+            
+        Returns:
+            GaussianTrainer instance with loaded state
+        """
+        checkpoint_path = Path(checkpoint_path)
+        
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location='cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Extract info
+        iteration = checkpoint['iteration']
+        config = checkpoint['config']
+        if scene_name is None:
+            scene_name = checkpoint.get('scene_name', 'unknown_scene')
+        
+        print(f"Loading checkpoint: {checkpoint_path}")
+        print(f"  Iteration: {iteration}")
+        print(f"  Scene: {scene_name}")
+        
+        # Load model weights
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Create trainer
+        trainer = cls(model, scene, scene_name, config, base_output_dir)
+        
+        # Load optimizer and scheduler state
+        if 'optimizer_state_dict' in checkpoint:
+            trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scheduler_state_dict' in checkpoint:
+            trainer.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        trainer.current_iteration = iteration
+        
+        trainer.logger.info(f"Loaded checkpoint from iteration {iteration}")
+        
+        return trainer
+
+    @classmethod  
+    def from_latest_checkpoint(cls, checkpoint_dir, model, scene, scene_name=None,
+                               base_output_dir="/workspace/Home_Reconstruction/outputs"):
+        """
+        Create a trainer instance from the latest checkpoint in a directory.
+        
+        Args:
+            checkpoint_dir: Directory containing checkpoints
+            model: Model instance
+            scene: Scene instance  
+            scene_name: Optional scene name
+            base_output_dir: Base output directory
+            
+        Returns:
+            GaussianTrainer instance with loaded state
+        """
+        latest_checkpoint = cls.find_latest_checkpoint(checkpoint_dir)
+        return cls.from_checkpoint(latest_checkpoint, model, scene, scene_name, base_output_dir)
+    
+    def save_splat_ply(self, save_path=None):
+        """
+        Export Gaussian splat to .ply format for viewing in external tools.
+        
+        Args:
+            save_path: Path to save .ply file (defaults to final_outputs/splat_iter{N}.ply)
+            
+        Returns:
+            Path to saved file
+        """
+        import numpy as np
+        
+        # Use default path in final_outputs if not provided
+        if save_path is None:
+            save_path = self.run_manager.final_outputs_dir / f'splat_iter{self.current_iteration:06d}.ply'
+        else:
+            save_path = Path(save_path)
+        
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        self.logger.info(f"Exporting splat to PLY: {save_path}")
+        
+        self.model.eval()
+        
+        with torch.no_grad():
+            params = self.model.get_parameters_as_tensors()
+            
+            pos = params['pos'].cpu().numpy()
+            opacity = torch.sigmoid(params['opacity_raw']).cpu().numpy()
+            scales = torch.exp(params['scale_raw']).cpu().numpy()
+            rotation = params['rotation'].cpu().numpy()
+            colors = params['color'].cpu().numpy()
+            
+            # Validate and clip colors to [0, 1] range
+            colors = np.clip(colors, 0, 1)
+            
+            # Convert colors to 0-255 uchar range for Open3D compatibility
+            colors_uint8 = (colors * 255).astype(np.uint8)
+            
+            num_gaussians = pos.shape[0]
+            
+            # Log color statistics for debugging
+            self.logger.info(f"  Color stats: min={colors.min():.3f}, max={colors.max():.3f}, mean={colors.mean():.3f}")
+            self.logger.info(f"  Color uint8: min={colors_uint8.min()}, max={colors_uint8.max()}, mean={colors_uint8.mean():.1f}")
+        
+        # Write PLY file with colors IMMEDIATELY after xyz for Open3D compatibility
+        # Open3D expects: x, y, z, red, green, blue (in that order, adjacent)
+        with open(save_path, 'w') as f:
+            # Header - CRITICAL: put rgb right after xyz
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {num_gaussians}\n")
+            # Standard properties first (Open3D reads these)
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
+            # Custom Gaussian splatting properties after
+            f.write("property float opacity\n")
+            f.write("property float scale_0\n")
+            f.write("property float scale_1\n")
+            f.write("property float scale_2\n")
+            f.write("property float rot_0\n")
+            f.write("property float rot_1\n")
+            f.write("property float rot_2\n")
+            f.write("property float rot_3\n")
+            f.write("end_header\n")
+            
+            # Data - write in same order as header (xyz, rgb, then custom)
+            for i in range(num_gaussians):
+                # Position
+                f.write(f"{pos[i,0]:.6f} {pos[i,1]:.6f} {pos[i,2]:.6f} ")
+                # Colors as integers (uchar format)
+                f.write(f"{int(colors_uint8[i,0])} {int(colors_uint8[i,1])} {int(colors_uint8[i,2])} ")
+                # Opacity
+                op_val = opacity[i,0] if opacity.ndim > 1 else opacity[i]
+                f.write(f"{op_val:.6f} ")
+                # Scales
+                f.write(f"{scales[i,0]:.6f} {scales[i,1]:.6f} {scales[i,2]:.6f} ")
+                # Rotation quaternion
+                f.write(f"{rotation[i,0]:.6f} {rotation[i,1]:.6f} {rotation[i,2]:.6f} {rotation[i,3]:.6f}\n")
+        
+        self.logger.info(f"Saved {num_gaussians:,} Gaussians to {save_path}")
+        self.model.train()
+        
+        return save_path
+    
+    def export_final_outputs(self, include_ply=True, include_comparison_grid=True, 
+                         render_scale=0.5):
+        """
+        Export all final outputs: PLY, test renders, comparison grid, and clean model checkpoint.
+        
+        Args:
+            include_ply: Whether to export .ply file
+            include_comparison_grid: Whether to generate all_comparisons.png
+            render_scale: Scale factor for test renders (0.5 = half size)
+            
+        Returns:
+            dict with paths to exported files
+        """
+        self.logger.info("=" * 70)
+        self.logger.info("EXPORTING FINAL OUTPUTS")
+        self.logger.info("=" * 70)
+        
+        exports = {}
+        
+        # 1. Save PLY
+        if include_ply:
+            exports['ply'] = self.save_splat_ply()
+        
+        # 2. Test renders
+        render_dir = self.run_manager.final_outputs_dir / 'test_renders'
+        render_dir.mkdir(exist_ok=True)
+        self.render_test_sequence(output_dir=render_dir, save_comparison=True, scale=render_scale)
+        exports['renders'] = render_dir
+        
+        # 3. Comparison grid - reuse show_test_grid with save_path
+        if include_comparison_grid:
+            grid_path = self.run_manager.final_outputs_dir / 'all_comparisons.png'
+            exports['comparison_grid'] = self.show_test_grid(
+                output_dir=render_dir, 
+                save_path=grid_path
+            )
+        
+        # 4. Clean model checkpoint
+        clean_model_path = self.run_manager.final_outputs_dir / f'model_iter{self.current_iteration:06d}.pth'
+        torch.save({
+            'iteration': self.current_iteration,
+            'model_state_dict': self.model.state_dict(),
+            'config': self.config,
+            'scene_name': self.run_manager.scene_name,
+            'run_name': self.run_manager.run_name,
+        }, clean_model_path)
+        exports['model'] = clean_model_path
+        
+        self.logger.info("=" * 70)
+        self.logger.info("EXPORT COMPLETE")
+        self.logger.info("=" * 70)
+        for key, path in exports.items():
+            self.logger.info(f"  {key}: {path}")
+        self.logger.info("=" * 70)
+        
+        return exports
+        
     def render_all_test_views(self, scale: float = 0.5):
         """Render all test views to final_outputs"""
         self.render_test_sequence(
@@ -544,7 +808,7 @@ class GaussianTrainer:
         self.logger.info(f"Saved {len(self.test_cameras)} renders to {output_dir}")
     
     def show_test_grid(self, num_images: int = None, cols: int = 4, figsize_per_image: float = 4.0,
-                       output_dir=None):
+                   output_dir=None, save_path=None):
         """
         Display test comparison images in a grid (for Jupyter notebooks).
         
@@ -553,10 +817,14 @@ class GaussianTrainer:
             cols: Number of columns in grid
             figsize_per_image: Figure size multiplier per image
             output_dir: Directory containing test images (defaults to final_outputs)
+            save_path: If provided, save to this path instead of displaying
         
         Returns:
-            matplotlib figure
+            matplotlib figure (or path if saved)
         """
+        import matplotlib
+        if save_path:
+            matplotlib.use('Agg')  # Non-interactive backend for saving
         import matplotlib.pyplot as plt
         from PIL import Image
         import math
@@ -581,7 +849,6 @@ class GaussianTrainer:
         rows = math.ceil(n_images / cols)
         
         # Calculate figure size
-        # Load one image to get aspect ratio
         sample_img = Image.open(image_files[0])
         aspect = sample_img.width / sample_img.height
         
@@ -613,11 +880,21 @@ class GaussianTrainer:
             col = idx % cols
             axes[row][col].axis('off')
         
-        plt.suptitle(f'Test Comparisons: Rendered (left) vs Ground Truth (right)\n{output_dir}', 
+        plt.suptitle(f'Test Comparisons: Rendered (left) vs Ground Truth (right)\n'
+                     f'{self.run_manager.scene_name} - {self.run_manager.run_name}', 
                      fontsize=12, y=1.02)
         plt.tight_layout()
         
-        return fig
+        # Save or return
+        if save_path:
+            save_path = Path(save_path)
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            self.logger.info(f"Saved comparison grid: {save_path}")
+            return save_path
+        else:
+            return fig
+    
     
     def show_progress_grid(self, cols: int = 5, figsize_per_image: float = 3.0):
         """
