@@ -1,11 +1,7 @@
 """
 ObjectGS: Anchor-based Gaussian Splatting with Object Awareness
 
-PERFORMANCE FIX: Batched parameters - no Python loops in forward pass!
-This should give ~50-100x speedup.
-
-Original issue: get_parameters_as_tensors() iterated through all anchors in Python
-Fix: Store all anchor data as batched tensors, update in-place
+UPDATED: Full semantic support with object-aware losses and rendering
 """
 
 import torch
@@ -13,14 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import logging
-import os
-from datetime import datetime
-import pytz
 
-
-# =============================================================================
-# ATTRIBUTE MLP (unchanged)
-# =============================================================================
 
 class AttributeMLP(nn.Module):
     """MLP to generate Gaussian attributes from anchor features"""
@@ -55,12 +44,6 @@ class AttributeMLP(nn.Module):
         )
     
     def forward(self, anchor_features):
-        """
-        Args:
-            anchor_features: [N, F] batched anchor features
-        Returns:
-            opacity_raw, scale_raw, rotation, color
-        """
         batch_size = anchor_features.shape[0]
         
         opacity_raw = self.opacity_mlp(anchor_features)
@@ -79,20 +62,31 @@ class AttributeMLP(nn.Module):
         return opacity_raw, scale_raw, rotation, color
 
 
-# =============================================================================
-# FAST MODEL - BATCHED PARAMETERS
-# =============================================================================
-
 class ObjectGSModel(nn.Module):
     """
-    ObjectGS Model - FAST VERSION
+    ObjectGS Model with Full Semantic Support
     
-    Key difference: All anchor parameters stored as batched tensors
-    No Python loops in forward pass!
+    Features:
+    - Per-Gaussian object IDs from SAM3 segmentation
+    - Object-aware rendering (can render specific objects)
+    - Semantic loss support
+    - Object isolation for editing
     """
     
     def __init__(self, point_cloud, colors, object_ids=None, 
-                 voxel_size=0.02, k=10, feature_dim=32, logger=None):
+                 voxel_size=0.02, k=10, feature_dim=32, 
+                 object_names=None, logger=None):
+        """
+        Args:
+            point_cloud: (N, 3) numpy array of points
+            colors: (N, 3) numpy array of RGB colors [0, 1]
+            object_ids: (N,) numpy array of integer object IDs (0=background)
+            voxel_size: Voxel size for anchor creation
+            k: Number of Gaussians per anchor
+            feature_dim: Anchor feature dimension
+            object_names: List of object names (e.g., ["bed", "dresser", ...])
+            logger: Optional logger
+        """
         super().__init__()
         
         self.logger = logger
@@ -100,55 +94,64 @@ class ObjectGSModel(nn.Module):
         self.feature_dim = feature_dim
         self.voxel_size = voxel_size
         
+        # Handle missing object_ids
         if object_ids is None:
-            object_ids = np.ones(len(point_cloud), dtype=np.int32)
+            object_ids = np.zeros(len(point_cloud), dtype=np.int32)
+            if self.logger:
+                self.logger.warning("No object_ids provided, using all zeros (background)")
         
         self.num_objects = int(object_ids.max()) + 1
+        self.object_names = object_names or [f"object_{i}" for i in range(self.num_objects)]
+        self.object_names[0] = "background"  # ID 0 is always background
         
         if self.logger:
             self.logger.info("=" * 70)
-            self.logger.info("INITIALIZING ObjectGSModelFast (BATCHED)")
+            self.logger.info("INITIALIZING ObjectGSModel WITH SEMANTICS")
             self.logger.info("=" * 70)
             self.logger.info(f"Input points: {len(point_cloud):,}")
             self.logger.info(f"Voxel size: {voxel_size}")
             self.logger.info(f"k (Gaussians/anchor): {k}")
             self.logger.info(f"Feature dim: {feature_dim}")
+            self.logger.info(f"Number of objects: {self.num_objects}")
+            for i, name in enumerate(self.object_names[:10]):
+                count = np.sum(object_ids == i)
+                self.logger.info(f"  ID {i}: {name} ({count:,} points)")
+            if self.num_objects > 10:
+                self.logger.info(f"  ... and {self.num_objects - 10} more")
         
-        # Voxelize and create anchor data
+        # Voxelize with semantic voting
         anchor_positions, anchor_colors, anchor_object_ids = self._voxelize(
             point_cloud, colors, object_ids
         )
         
         num_anchors = len(anchor_positions)
         if self.logger:
-            self.logger.info(f"Created {num_anchors} anchors → {num_anchors * k:,} Gaussians")
+            self.logger.info(f"Created {num_anchors:,} anchors → {num_anchors * k:,} Gaussians")
+            
+            # Log anchor distribution per object
+            unique, counts = np.unique(anchor_object_ids, return_counts=True)
+            self.logger.info("Anchors per object:")
+            for obj_id, count in zip(unique, counts):
+                name = self.object_names[obj_id] if obj_id < len(self.object_names) else f"object_{obj_id}"
+                self.logger.info(f"  {name}: {count:,} anchors ({count * k:,} Gaussians)")
         
-        # =====================================================================
-        # BATCHED PARAMETERS - This is the key fix!
-        # =====================================================================
-        
-        # Fixed buffers (not learnable)
+        # Fixed buffers
         self.register_buffer('anchor_positions', torch.tensor(anchor_positions, dtype=torch.float32))
         self.register_buffer('anchor_colors', torch.tensor(anchor_colors, dtype=torch.float32))
         self.register_buffer('anchor_object_ids', torch.tensor(anchor_object_ids, dtype=torch.long))
         
-        # Learnable parameters - ALL BATCHED
-        # Features: [num_anchors, feature_dim]
+        # Learnable parameters
         features_init = torch.randn(num_anchors, feature_dim) * 0.1
-        features_init[:, :3] = self.anchor_colors  # Initialize with anchor colors
+        features_init[:, :3] = self.anchor_colors
         self.anchor_features = nn.Parameter(features_init)
         
-        # Scalings: [num_anchors] - single scale per anchor
         self.anchor_scalings = nn.Parameter(torch.ones(num_anchors))
-        
-        # Offsets: [num_anchors, k, 3]
         self.anchor_offsets = nn.Parameter(torch.randn(num_anchors, k, 3) * 0.01)
         
-        # Pre-expand anchor colors for Gaussians: [num_anchors * k, 3]
+        # Pre-expanded buffers for Gaussians
         expanded_colors = self.anchor_colors.unsqueeze(1).expand(-1, k, -1).reshape(-1, 3)
         self.register_buffer('gaussian_anchor_colors', expanded_colors)
         
-        # Pre-expand object IDs: [num_anchors * k]
         expanded_obj_ids = self.anchor_object_ids.unsqueeze(1).expand(-1, k).reshape(-1)
         self.register_buffer('gaussian_object_ids', expanded_obj_ids)
         
@@ -160,15 +163,10 @@ class ObjectGSModel(nn.Module):
         self.num_gaussians = num_anchors * k
         
         if self.logger:
-            self.logger.info("-" * 50)
-            self.logger.info("BATCHED PARAMETER SHAPES:")
-            self.logger.info(f"  anchor_features: {list(self.anchor_features.shape)}")
-            self.logger.info(f"  anchor_scalings: {list(self.anchor_scalings.shape)}")
-            self.logger.info(f"  anchor_offsets:  {list(self.anchor_offsets.shape)}")
             self.logger.info("=" * 70)
     
     def _voxelize(self, points, colors, object_ids):
-        """Voxelize point cloud into anchors"""
+        """Voxelize point cloud with semantic majority voting"""
         voxel_indices = np.floor(points / self.voxel_size).astype(np.int32)
         
         voxel_dict = {}
@@ -186,7 +184,13 @@ class ObjectGSModel(nn.Module):
         for vidx, data in voxel_dict.items():
             pos = (np.array(vidx) + 0.5) * self.voxel_size
             avg_color = np.mean(data['colors'], axis=0)
-            obj_id = int(np.bincount(data['object_ids']).argmax())
+            
+            # Majority vote for object ID
+            ids = np.array(data['object_ids'])
+            if len(ids) > 0:
+                obj_id = int(np.bincount(ids).argmax())
+            else:
+                obj_id = 0
             
             anchor_positions.append(pos)
             anchor_colors.append(avg_color)
@@ -197,43 +201,45 @@ class ObjectGSModel(nn.Module):
                 np.array(anchor_object_ids))
     
     def _init_mlp(self):
-        """Initialize MLP with good defaults"""
+        """Initialize MLP weights"""
         with torch.no_grad():
-            # Scale: exp(-4) ≈ 0.018
             scale_out = self.attribute_mlp.scale_mlp[-1]
             scale_out.bias.data.fill_(-4.0)
             scale_out.weight.data *= 0.1
             
-            # Opacity: sigmoid(-2.2) ≈ 0.10
             opacity_out = self.attribute_mlp.opacity_mlp[-1]
             opacity_out.bias.data.fill_(-2.2)
             opacity_out.weight.data *= 0.1
             
-            # Color
             color_out = self.attribute_mlp.color_mlp[-1]
             color_out.weight.data *= 2.0
             color_out.bias.data.zero_()
             
-            # Rotation: identity quaternion
             rot_out = self.attribute_mlp.rotation_mlp[-1]
             rot_out.bias.data.zero_()
             rot_out.bias.data[3::4] = 1.0
     
-    def get_parameters_as_tensors(self):
+    def get_parameters_as_tensors(self, object_mask=None):
         """
-        Get all Gaussian parameters - FAST BATCHED VERSION
+        Get all Gaussian parameters.
         
-        No Python loops! All tensor operations.
+        Args:
+            object_mask: Optional list of object IDs to include.
+                        If None, returns all Gaussians.
+                        e.g., [1, 2] returns only Gaussians from objects 1 and 2
+        
+        Returns:
+            Dictionary of Gaussian parameters
         """
-        # Positions: [num_anchors, 1, 3] + [num_anchors, k, 3] * [num_anchors, 1, 1]
+        # Compute positions
         positions = (self.anchor_positions.unsqueeze(1) + 
                     self.anchor_offsets * self.anchor_scalings.unsqueeze(1).unsqueeze(2))
-        positions = positions.reshape(-1, 3)  # [num_gaussians, 3]
+        positions = positions.reshape(-1, 3)
         
-        # MLP forward pass - single batched call
+        # MLP forward
         opacity_raw, scale_raw, rotation, color_delta = self.attribute_mlp(self.anchor_features)
         
-        # Flatten: [num_anchors, k, ...] -> [num_gaussians, ...]
+        # Flatten
         opacity_raw = opacity_raw.reshape(-1, 1)
         scale_raw = scale_raw.reshape(-1, 3)
         rotation = rotation.reshape(-1, 4)
@@ -243,10 +249,10 @@ class ObjectGSModel(nn.Module):
         color = self.gaussian_anchor_colors + (color_delta - 0.5) * 1.0
         color = torch.clamp(color, 0, 1)
         
-        # Object semantics
+        # Semantics
         semantics = F.one_hot(self.gaussian_object_ids, num_classes=self.num_objects).float()
         
-        return {
+        result = {
             'pos': positions,
             'opacity_raw': opacity_raw,
             'scale_raw': scale_raw,
@@ -260,6 +266,62 @@ class ObjectGSModel(nn.Module):
             'num_anchors': self.num_anchors,
             'num_objects': self.num_objects
         }
+        
+        # Apply object mask if specified
+        if object_mask is not None:
+            result = self._apply_object_mask(result, object_mask)
+        
+        return result
+    
+    def _apply_object_mask(self, params, object_ids_to_keep):
+        """Filter parameters to only include specified objects"""
+        mask = torch.zeros(self.num_gaussians, dtype=torch.bool, device=self.gaussian_object_ids.device)
+        for obj_id in object_ids_to_keep:
+            mask |= (self.gaussian_object_ids == obj_id)
+        
+        filtered = {
+            'pos': params['pos'][mask],
+            'opacity_raw': params['opacity_raw'][mask],
+            'scale_raw': params['scale_raw'][mask],
+            'rotation': params['rotation'][mask],
+            'color': params['color'][mask],
+            'color_delta': params['color_delta'][mask],
+            'anchor_colors': params['anchor_colors'][mask],
+            'object_ids': params['object_ids'][mask],
+            'semantics': params['semantics'][mask],
+            'num_gaussians': mask.sum().item(),
+            'num_anchors': self.num_anchors,  # Original count
+            'num_objects': self.num_objects,
+            'object_mask': mask,  # Include mask for reference
+        }
+        return filtered
+    
+    def get_object_gaussians(self, object_id):
+        """Get parameters for a single object"""
+        return self.get_parameters_as_tensors(object_mask=[object_id])
+    
+    def get_object_stats(self):
+        """Get statistics per object"""
+        stats = {}
+        for obj_id in range(self.num_objects):
+            mask = self.gaussian_object_ids == obj_id
+            count = mask.sum().item()
+            name = self.object_names[obj_id] if obj_id < len(self.object_names) else f"object_{obj_id}"
+            
+            if count > 0:
+                positions = (self.anchor_positions.unsqueeze(1) + 
+                            self.anchor_offsets * self.anchor_scalings.unsqueeze(1).unsqueeze(2))
+                positions = positions.reshape(-1, 3)[mask]
+                
+                stats[obj_id] = {
+                    'name': name,
+                    'num_gaussians': count,
+                    'center': positions.mean(dim=0).cpu().numpy(),
+                    'bbox_min': positions.min(dim=0)[0].cpu().numpy(),
+                    'bbox_max': positions.max(dim=0)[0].cpu().numpy(),
+                }
+        
+        return stats
     
     def get_optimizer_param_groups(self, config):
         """Get parameter groups for optimizer"""
@@ -269,3 +331,46 @@ class ObjectGSModel(nn.Module):
             {'params': [self.anchor_offsets], 'lr': config.get('lr_position', 0.00016), 'name': 'offsets'},
             {'params': self.attribute_mlp.parameters(), 'lr': config.get('lr', 0.001), 'name': 'mlp'}
         ]
+    
+    # =========================================================================
+    # OBJECT MANIPULATION METHODS
+    # =========================================================================
+    
+    def hide_object(self, object_id):
+        """
+        'Hide' an object by zeroing its opacity (non-destructive).
+        Note: This modifies the model state. Call unhide_object to restore.
+        """
+        if not hasattr(self, '_hidden_objects'):
+            self._hidden_objects = set()
+        self._hidden_objects.add(object_id)
+    
+    def unhide_object(self, object_id):
+        """Restore a hidden object"""
+        if hasattr(self, '_hidden_objects'):
+            self._hidden_objects.discard(object_id)
+    
+    def get_visible_parameters(self):
+        """Get parameters excluding hidden objects"""
+        if not hasattr(self, '_hidden_objects') or len(self._hidden_objects) == 0:
+            return self.get_parameters_as_tensors()
+        
+        visible_objects = [i for i in range(self.num_objects) if i not in self._hidden_objects]
+        return self.get_parameters_as_tensors(object_mask=visible_objects)
+    
+    def export_object_ply(self, object_id, output_path):
+        """Export a single object as a point cloud"""
+        import open3d as o3d
+        
+        params = self.get_object_gaussians(object_id)
+        positions = params['pos'].detach().cpu().numpy()
+        colors = params['color'].detach().cpu().numpy()
+        
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(positions)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        
+        o3d.io.write_point_cloud(str(output_path), pcd)
+        
+        name = self.object_names[object_id] if object_id < len(self.object_names) else f"object_{object_id}"
+        print(f"Exported {name} ({len(positions):,} Gaussians) to {output_path}")

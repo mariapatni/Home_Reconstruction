@@ -1,30 +1,36 @@
 """
 Point Cloud Visualization Tool
-Visualize and compare any number of point clouds side-by-side
+Visualize and compare point clouds with optional semantic coloring
 """
 
 import numpy as np
 from pathlib import Path
+import json
 
 
 def visualize_pointclouds(scene_path, ply_files, max_points=150000, 
-                         show_cameras=False, title=None, height=900):
+                         show_cameras=False, title=None, height=900,
+                         color_by_semantics=False, prompts=None):
     """
     Visualize multiple point clouds side-by-side
     
     Args:
         scene_path: Path to scene directory containing .ply files
         ply_files: LIST of .ply filenames (must be a list!)
-                   e.g., ["processed.ply"] or ["raw.ply", "filtered.ply"]
+                   e.g., ["processed.ply"] or ["processed_semantic.ply"]
         max_points: Maximum points to display per point cloud (default: 150K)
         show_cameras: Whether to show camera positions (default: False)
         title: Custom title for the plot (default: auto-generated)
         height: Plot height in pixels (default: 900)
+        color_by_semantics: Color points by object ID instead of RGB (default: False)
+        prompts: List of prompt names for legend (e.g., ["bed", "dresser", "lamp"])
+                 If None, will try to load from object_mapping.json
     """
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
     import plotly.io as pio
     import open3d as o3d
+    import matplotlib.pyplot as plt
     
     pio.renderers.default = "notebook_connected"
     
@@ -40,8 +46,19 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
     if len(ply_files) == 0:
         raise ValueError("ply_files list is empty")
     
+    # Try to load prompts from object_mapping.json if not provided
+    if color_by_semantics and prompts is None:
+        mapping_path = scene_path / "EXR_RGBD" / "masks" / "object_mapping.json"
+        if mapping_path.exists():
+            with open(mapping_path) as f:
+                mapping = json.load(f)
+            prompts = mapping.get("prompts", [])
+            print(f"Loaded prompts from mapping: {prompts}")
+    
     print(f"\n{'='*60}")
     print(f"Loading {len(ply_files)} point cloud(s) from {scene_path.name}")
+    if color_by_semantics:
+        print(f"🎨 Coloring by SEMANTIC OBJECT ID")
     print(f"{'='*60}\n")
     
     # Load point clouds
@@ -57,52 +74,91 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
         points = np.asarray(pcd.points)
         colors = np.asarray(pcd.colors)
         
-        # Validate colors were read correctly
-        if colors.size == 0 or colors.shape[0] != points.shape[0]:
-            print(f"  ⚠ Warning: Open3D didn't read colors properly (shape: {colors.shape})")
-            print(f"  → Attempting manual PLY color extraction...")
-            colors = _extract_colors_from_ply(ply_path, len(points))
+        # Load object IDs if semantic coloring requested
+        object_ids = None
+        if color_by_semantics:
+            # Try to find object_ids.npy
+            ids_path = scene_path / "object_ids.npy"
+            if not ids_path.exists():
+                # Try alternative locations
+                ids_path = scene_path / ply_file.replace(".ply", "_ids.npy")
+            
+            if ids_path.exists():
+                object_ids = np.load(ids_path)
+                print(f"  ✓ Loaded object IDs: {len(np.unique(object_ids))} unique objects")
+            else:
+                print(f"  ⚠ object_ids.npy not found, using RGB colors")
         
-        # Final validation
-        if colors.size == 0 or colors.shape[0] != points.shape[0]:
-            print(f"  ⚠ Warning: Could not read colors, using default gray")
-            colors = np.ones((len(points), 3)) * 0.5
-        else:
-            print(f"  ✓ Colors loaded: range=[{colors.min():.3f}, {colors.max():.3f}], mean={colors.mean():.3f}")
+        # Validate colors if not using semantics
+        if object_ids is None:
+            if colors.size == 0 or colors.shape[0] != points.shape[0]:
+                print(f"  ⚠ Warning: Could not read colors, using default gray")
+                colors = np.ones((len(points), 3)) * 0.5
         
         print(f"  ✓ {len(points):,} points")
         
         point_clouds.append({
             'name': ply_file,
             'points': points,
-            'colors': colors
+            'colors': colors,
+            'object_ids': object_ids
         })
     
     print()
     
+    # Create semantic colormap
+    def get_semantic_colors(object_ids, num_objects=20):
+        """Generate distinct colors for each object ID."""
+        cmap = plt.cm.get_cmap('tab20', num_objects)
+        
+        colors = np.zeros((len(object_ids), 3))
+        unique_ids = np.unique(object_ids)
+        
+        for obj_id in unique_ids:
+            mask = object_ids == obj_id
+            if obj_id == 0:
+                # Background = gray
+                colors[mask] = [0.5, 0.5, 0.5]
+            else:
+                colors[mask] = cmap(obj_id % 20)[:3]
+        
+        return colors, unique_ids
+    
     # Downsample for performance
-    def downsample_for_plot(points, colors, max_pts):
+    def downsample_for_plot(points, colors, object_ids, max_pts):
         if len(points) > max_pts:
             indices = np.random.choice(len(points), max_pts, replace=False)
-            return points[indices], colors[indices]
-        return points, colors
+            new_ids = object_ids[indices] if object_ids is not None else None
+            return points[indices], colors[indices], new_ids
+        return points, colors, object_ids
     
     def colors_to_rgb_strings(colors):
-        # Ensure colors are in [0, 1] range before scaling
         colors_clipped = np.clip(colors, 0, 1)
         colors_rgb = (colors_clipped * 255).astype(int)
         return [f'rgb({r},{g},{b})' for r, g, b in colors_rgb]
     
     # Prepare plot data
     plot_data = []
+    all_unique_ids = set()
+    
     for pc in point_clouds:
-        pts, cols = downsample_for_plot(pc['points'], pc['colors'], max_points)
+        pts = pc['points']
+        cols = pc['colors']
+        obj_ids = pc['object_ids']
+        
+        # Apply semantic coloring if available
+        if obj_ids is not None:
+            cols, unique_ids = get_semantic_colors(obj_ids)
+            all_unique_ids.update(unique_ids)
+        
+        pts, cols, obj_ids = downsample_for_plot(pts, cols, obj_ids, max_points)
         rgb_strings = colors_to_rgb_strings(cols)
         
         plot_data.append({
             'name': pc['name'],
             'points': pts,
             'colors': rgb_strings,
+            'object_ids': obj_ids,
             'original_count': len(pc['points'])
         })
     
@@ -136,7 +192,7 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
                 marker=dict(
                     size=1,
                     color=data['colors'],
-                    opacity=0.6
+                    opacity=0.8
                 ),
                 name=data['name'],
                 showlegend=False
@@ -144,50 +200,39 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
             row=1, col=col_idx
         )
     
-    # Add cameras if requested
-    if show_cameras:
-        try:
-            from scene.record3d_loader import Record3DScene
-            scene = Record3DScene(scene_path=str(scene_path), model=None)
-            
-            train_positions = np.array([cam.camera_center.cpu().numpy() 
-                                       for cam in scene.train_cameras])
-            test_positions = np.array([cam.camera_center.cpu().numpy() 
-                                      for cam in scene.test_cameras])
-            
-            for col_idx in range(1, n_cols + 1):
-                fig.add_trace(
-                    go.Scatter3d(
-                        x=train_positions[:, 0],
-                        y=train_positions[:, 1],
-                        z=train_positions[:, 2],
-                        mode='markers',
-                        marker=dict(size=6, color='red', symbol='diamond'),
-                        name='Train cameras',
-                        showlegend=(col_idx == 1)
-                    ),
-                    row=1, col=col_idx
-                )
-                
-                fig.add_trace(
-                    go.Scatter3d(
-                        x=test_positions[:, 0],
-                        y=test_positions[:, 1],
-                        z=test_positions[:, 2],
-                        mode='markers',
-                        marker=dict(size=6, color='green', symbol='diamond'),
-                        name='Test cameras',
-                        showlegend=(col_idx == 1)
-                    ),
-                    row=1, col=col_idx
-                )
+    # Add legend traces for semantic colors
+    if color_by_semantics and len(all_unique_ids) > 0:
+        cmap = plt.cm.get_cmap('tab20', 20)
         
-        except Exception as e:
-            print(f"Warning: Could not load cameras: {e}")
+        for obj_id in sorted(all_unique_ids):
+            if obj_id == 0:
+                color = 'rgb(128,128,128)'
+                name = "background"
+            else:
+                c = cmap(obj_id % 20)[:3]
+                color = f'rgb({int(c[0]*255)},{int(c[1]*255)},{int(c[2]*255)})'
+                if prompts and obj_id <= len(prompts):
+                    name = f"{obj_id}: {prompts[obj_id - 1]}"
+                else:
+                    name = f"object_{obj_id}"
+            
+            # Add invisible trace for legend
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[None], y=[None], z=[None],
+                    mode='markers',
+                    marker=dict(size=10, color=color),
+                    name=name,
+                    showlegend=True
+                ),
+                row=1, col=1
+            )
     
     # Update layout
     if title is None:
-        if len(plot_data) == 1:
+        if color_by_semantics:
+            title = f"Semantic Point Cloud - {len(all_unique_ids)} objects"
+        elif len(plot_data) == 1:
             title = f"{plot_data[0]['name']} - {plot_data[0]['original_count']:,} points"
         else:
             title = f"Point Cloud Comparison - {len(plot_data)} files"
@@ -201,13 +246,14 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
         ),
         width=width,
         height=height,
-        showlegend=show_cameras,
+        showlegend=color_by_semantics or show_cameras,
         legend=dict(
-            x=0.5, 
-            y=1.08, 
-            xanchor='center', 
-            orientation='h',
-            bgcolor='rgba(255,255,255,0.8)'
+            x=1.02, 
+            y=0.5,
+            yanchor='middle',
+            bgcolor='rgba(255,255,255,0.9)',
+            bordercolor='rgba(0,0,0,0.3)',
+            borderwidth=1
         ),
         paper_bgcolor='white',
         plot_bgcolor='white'
@@ -238,73 +284,24 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
         displayed = len(data['points'])
         total = data['original_count']
         print(f"{data['name']:30s} {total:>10,} points ({displayed:>7,} displayed)")
-    print(f"{'='*60}\n")
-
-
-def _extract_colors_from_ply(ply_path, num_points):
-    """
-    Manually extract colors from PLY file when Open3D fails.
-    Handles PLY files with custom properties between xyz and rgb.
-    """
-    ply_path = Path(ply_path)
     
-    try:
-        with open(ply_path, 'r') as f:
-            lines = f.readlines()
-        
-        # Parse header to find property order
-        header_end = 0
-        properties = []
-        
-        for i, line in enumerate(lines):
-            line = line.strip()
-            if line == 'end_header':
-                header_end = i + 1
-                break
-            if line.startswith('property'):
-                parts = line.split()
-                if len(parts) >= 3:
-                    prop_type = parts[1]
-                    prop_name = parts[2]
-                    properties.append((prop_name, prop_type))
-        
-        # Find color property indices
-        prop_names = [p[0] for p in properties]
-        
-        try:
-            red_idx = prop_names.index('red')
-            green_idx = prop_names.index('green')
-            blue_idx = prop_names.index('blue')
-        except ValueError:
-            print(f"  → Could not find red/green/blue properties in PLY")
-            return np.array([])
-        
-        # Determine if colors are uchar (0-255) or float (0-1)
-        color_type = properties[red_idx][1]
-        is_uchar = color_type == 'uchar'
-        
-        # Parse data lines
-        colors = []
-        data_lines = lines[header_end:header_end + num_points]
-        
-        for line in data_lines:
-            values = line.strip().split()
-            if len(values) > max(red_idx, green_idx, blue_idx):
-                r = float(values[red_idx])
-                g = float(values[green_idx])
-                b = float(values[blue_idx])
-                
-                # Normalize to [0, 1] if uchar
-                if is_uchar:
-                    r, g, b = r / 255.0, g / 255.0, b / 255.0
-                
-                colors.append([r, g, b])
-        
-        colors = np.array(colors, dtype=np.float64)
-        print(f"  → Manual extraction successful: {len(colors)} colors")
-        
-        return colors
-        
-    except Exception as e:
-        print(f"  → Manual color extraction failed: {e}")
-        return np.array([])
+    if color_by_semantics and len(all_unique_ids) > 0:
+        print(f"\n🎨 Object Legend:")
+        print("-" * 40)
+        for obj_id in sorted(all_unique_ids):
+            if obj_id == 0:
+                name = "background"
+            elif prompts and obj_id <= len(prompts):
+                name = prompts[obj_id - 1]
+            else:
+                name = f"object_{obj_id}"
+            
+            # Count points with this ID
+            total_pts = sum(
+                np.sum(data['object_ids'] == obj_id) 
+                for data in plot_data 
+                if data['object_ids'] is not None
+            )
+            print(f"  ID {obj_id:2d}: {name:20s} ({total_pts:,} pts)")
+    
+    print(f"{'='*60}\n")
