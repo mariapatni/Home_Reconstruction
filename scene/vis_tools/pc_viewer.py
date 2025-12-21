@@ -6,6 +6,7 @@ Visualize and compare point clouds with optional semantic coloring
 import numpy as np
 from pathlib import Path
 import json
+import matplotlib.pyplot as plt
 
 
 def visualize_pointclouds(scene_path, ply_files, max_points=150000, 

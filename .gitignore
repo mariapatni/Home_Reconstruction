@@ -33,3 +33,4 @@ outputs/
 point_cloud*.ply
 combined*.ply
 diagnostic*.html
+.tokens

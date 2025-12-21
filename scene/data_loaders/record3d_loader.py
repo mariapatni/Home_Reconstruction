@@ -623,24 +623,14 @@ def reconstruct_from_rgbd(scene_path, frame_indices, subsample=4):
 # =============================================================================
 # Main Scene Class
 # =============================================================================
-
 class Record3DScene:
     """Scene loader for Record3D data WITH SEMANTIC SUPPORT"""
     
     def __init__(self, scene_path, train_frames=None, test_frames=None,
                  subsample=4, pointcloud_path=None,
-                 use_semantics=True, frame_step=20, test_ratio=0.2):
-        """
-        Args:
-            scene_path: Path to scene directory
-            train_frames: List of frame indices for training (or None for auto)
-            test_frames: List of frame indices for testing (or None for auto)
-            subsample: Subsampling factor for RGBD reconstruction
-            pointcloud_path: Optional path to custom PLY file
-            use_semantics: Whether to load/generate semantic labels
-            frame_step: Step size for auto-selecting training frames
-            test_ratio: Ratio of test frames to training frames
-        """
+                 use_semantics=True, frame_step=20, test_ratio=0.2,
+                 redo_semantics=False):  # <-- added flag
+        
         self.scene_path = Path(scene_path)
         self.model_path = str(scene_path)
         self.use_semantics = use_semantics
@@ -692,11 +682,14 @@ class Record3DScene:
         
         elif use_semantics and self.has_masks:
             # Try to load semantic point cloud
-            points, colors, object_ids = load_processed_pointcloud_with_semantics(self.scene_path)
+            semantic_exists = (self.scene_path / "processed_semantic.ply").exists() and \
+                              (self.scene_path / "object_ids.npy").exists()
             
-            if points is None:
-                # Create semantic point cloud
-                print("processed_semantic.ply not found, creating...")
+            if semantic_exists and not redo_semantics:
+                points, colors, object_ids = load_processed_pointcloud_with_semantics(self.scene_path)
+            else:
+                # Force regeneration
+                print("Creating semantic point cloud...")
                 points, colors, object_ids = reconstruct_from_rgbd_with_semantics(
                     self.scene_path,
                     frame_indices=train_frames,
@@ -724,16 +717,8 @@ class Record3DScene:
         self.colors = colors
         self.object_ids = object_ids
         self.num_objects = int(object_ids.max()) + 1 if len(object_ids) > 0 else 1
-        
-        print(f"\nScene initialized:")
-        print(f"  Points: {len(points):,}")
-        print(f"  Objects: {self.num_objects}")
-        if self.has_masks:
-            unique_ids = np.unique(object_ids)
-            print(f"  Object IDs: {unique_ids.tolist()[:10]}{'...' if len(unique_ids) > 10 else ''}")
-        
-        self.background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
-    
+
+
     def _create_cameras(self, meta, frame_indices):
         """Create camera objects for specified frames"""
         from tqdm import tqdm

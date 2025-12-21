@@ -17,8 +17,9 @@ def generate_masks_sam3_image(
     frame_step=20,
     device="cuda",
     score_threshold=0.3,
-    save_visualizations=True,  # NEW: Save vis folder
-    overlay_alpha=0.5,         # NEW: Transparency of mask overlay
+    save_visualizations=True,  
+    overlay_alpha=0.5,    
+    redo_masks=False
 ):
     """
     Generate masks using SAM3 IMAGE model for selected frames.
@@ -31,7 +32,7 @@ def generate_masks_sam3_image(
     rgb_dir = scene_path / "EXR_RGBD" / "rgb"
     masks_dir = scene_path / "EXR_RGBD" / "masks"
     vis_dir = scene_path / "EXR_RGBD" / "vis"
-    
+
     masks_dir.mkdir(parents=True, exist_ok=True)
     if save_visualizations:
         vis_dir.mkdir(parents=True, exist_ok=True)
@@ -65,8 +66,8 @@ def generate_masks_sam3_image(
         mask_output_path = masks_dir / f"{frame_name}.png"
         vis_output_path = vis_dir / f"{frame_name}.png"
         
-        # Skip if already processed (check both mask and vis)
-        if mask_output_path.exists() and (not save_visualizations or vis_output_path.exists()):
+        # Skip if already processed unless redo_masks is True
+        if not redo_masks and mask_output_path.exists() and (not save_visualizations or vis_output_path.exists()):
             continue
         
         image = Image.open(rgb_path)
@@ -336,46 +337,3 @@ def create_summary_legend(vis_dir, prompts, colors):
     legend_path = vis_dir / "legend.png"
     img.save(legend_path)
     print(f"  Saved legend: {legend_path}")
-
-
-# # ============================================================
-# # Usage
-# # ============================================================
-
-# scene_path = Path("/workspace/Home_Reconstruction/data_scenes/maria bedroom")
-
-# # Clear existing masks/vis if you want to regenerate
-# # import shutil
-# # masks_dir = scene_path / "EXR_RGBD" / "masks"
-# # vis_dir = scene_path / "EXR_RGBD" / "vis"
-# # if masks_dir.exists(): shutil.rmtree(masks_dir)
-# # if vis_dir.exists(): shutil.rmtree(vis_dir)
-
-# # Generate masks WITH visualizations
-# generate_masks_sam3_image(
-#     scene_path=scene_path,
-#     text_prompts=[
-#         "nightstand", "dresser", "desk", "chair", "wardrobe",
-#         "mirror", "lamp", "ceiling light", "pillow", "blanket",
-#         "curtain", "rug", "plant", "picture frame", "window",
-#         "door", "floor", "wall", "ceiling", "bed"
-#     ],
-#     frame_step=20,
-#     save_visualizations=True,  # Creates /vis/ folder
-#     overlay_alpha=0.5,         # Adjust transparency (0-1)
-# )
-# ```
-
-# This creates:
-# ```
-# EXR_RGBD/
-# ├── masks/
-# │   ├── 0.png
-# │   ├── 20.png
-# │   ├── ...
-# │   └── object_mapping.json
-# └── vis/
-#     ├── 0.png          # Colored overlay with legend
-#     ├── 20.png
-#     ├── ...
-#     └── legend.png     # Standalone legend image
