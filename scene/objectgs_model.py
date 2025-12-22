@@ -1,7 +1,11 @@
 """
 ObjectGS: Anchor-based Gaussian Splatting with Object Awareness
 
-UPDATED: Full semantic support with object-aware losses and rendering
+COMPLETE IMPLEMENTATION with:
+- View-dependent attribute generation (direction + distance)
+- Dynamic anchor growing and pruning
+- Full semantic support with object-aware rendering
+- Anchor color baseline for proper initialization
 """
 
 import torch
@@ -9,43 +13,86 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import logging
+from typing import Optional, List, Dict, Tuple
 
 
-class AttributeMLP(nn.Module):
-    """MLP to generate Gaussian attributes from anchor features"""
+class ViewDependentAttributeMLP(nn.Module):
+    """
+    MLP to generate Gaussian attributes from anchor features.
     
-    def __init__(self, feature_dim=32, k=10):
+    Now includes view-dependence following the paper:
+    {c_0, ..., c_{k-1}} = MLP(f, δ, d)
+    
+    Where:
+    - f = anchor feature
+    - δ = viewing distance (scalar)
+    - d = viewing direction (3D unit vector)
+    
+    Color is output as a DELTA to be added to anchor colors.
+    """
+    
+    def __init__(self, feature_dim: int = 32, k: int = 10, view_dim: int = 4):
+        """
+        Args:
+            feature_dim: Dimension of anchor features
+            k: Number of Gaussians per anchor
+            view_dim: Dimension of view encoding (1 distance + 3 direction = 4)
+        """
         super().__init__()
         self.k = k
         self.feature_dim = feature_dim
+        self.view_dim = view_dim
         
+        # Input dim for view-dependent MLPs
+        view_input_dim = feature_dim + view_dim
+        
+        # Opacity: view-independent (doesn't change with viewpoint)
         self.opacity_mlp = nn.Sequential(
             nn.Linear(feature_dim, 64),
             nn.ReLU(),
             nn.Linear(64, k)
         )
         
+        # Scale: view-independent
         self.scale_mlp = nn.Sequential(
             nn.Linear(feature_dim, 128),
             nn.ReLU(),
             nn.Linear(128, k * 3)
         )
         
+        # Rotation: view-independent
         self.rotation_mlp = nn.Sequential(
             nn.Linear(feature_dim, 128),
             nn.ReLU(),
             nn.Linear(128, k * 4)
         )
         
+        # Color: VIEW-DEPENDENT, outputs DELTA (not absolute color)
         self.color_mlp = nn.Sequential(
-            nn.Linear(feature_dim, 128),
+            nn.Linear(view_input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
             nn.ReLU(),
             nn.Linear(128, k * 3)
         )
     
-    def forward(self, anchor_features):
+    def forward(self, anchor_features: torch.Tensor, 
+                view_dirs: Optional[torch.Tensor] = None,
+                view_dists: Optional[torch.Tensor] = None) -> Tuple:
+        """
+        Generate Gaussian attributes.
+        
+        Args:
+            anchor_features: [N, feature_dim] anchor features
+            view_dirs: [N, 3] unit vectors from anchor to camera (optional)
+            view_dists: [N, 1] distances from anchor to camera (optional)
+        
+        Returns:
+            opacity_raw, scale_raw, rotation, color_delta
+        """
         batch_size = anchor_features.shape[0]
         
+        # View-independent attributes
         opacity_raw = self.opacity_mlp(anchor_features)
         
         scale_raw = self.scale_mlp(anchor_features)
@@ -55,27 +102,40 @@ class AttributeMLP(nn.Module):
         rotation = rotation.reshape(batch_size, self.k, 4)
         rotation = rotation / (rotation.norm(dim=-1, keepdim=True) + 1e-9)
         
-        color = self.color_mlp(anchor_features)
-        color = color.reshape(batch_size, self.k, 3)
-        color = torch.tanh(color) * 0.5 + 0.5
+        # View-dependent color delta
+        if view_dirs is not None and view_dists is not None:
+            # Concatenate features with view information
+            view_info = torch.cat([view_dists, view_dirs], dim=-1)  # [N, 4]
+            color_input = torch.cat([anchor_features, view_info], dim=-1)  # [N, feature_dim + 4]
+        else:
+            # Fallback: pad with zeros if no view info (for export, etc.)
+            zeros = torch.zeros(batch_size, self.view_dim, device=anchor_features.device)
+            color_input = torch.cat([anchor_features, zeros], dim=-1)
         
-        return opacity_raw, scale_raw, rotation, color
+        color_delta = self.color_mlp(color_input)
+        color_delta = color_delta.reshape(batch_size, self.k, 3)
+        # Use tanh to get delta in range [-1, 1], then scale
+        color_delta = torch.tanh(color_delta) * 0.5 + 0.5  # Now in [0, 1] range
+        
+        return opacity_raw, scale_raw, rotation, color_delta
 
 
 class ObjectGSModel(nn.Module):
     """
-    ObjectGS Model with Full Semantic Support
+    ObjectGS Model - Complete Implementation
     
     Features:
     - Per-Gaussian object IDs from SAM3 segmentation
-    - Object-aware rendering (can render specific objects)
-    - Semantic loss support
-    - Object isolation for editing
+    - View-dependent color generation with anchor color baseline
+    - Dynamic anchor growing and pruning
+    - Object-aware rendering and editing
     """
     
-    def __init__(self, point_cloud, colors, object_ids=None, 
-                 voxel_size=0.02, k=10, feature_dim=32, 
-                 object_names=None, logger=None):
+    def __init__(self, point_cloud: np.ndarray, colors: np.ndarray, 
+                 object_ids: Optional[np.ndarray] = None,
+                 voxel_size: float = 0.02, k: int = 10, feature_dim: int = 32,
+                 object_names: Optional[List[str]] = None, 
+                 logger: Optional[logging.Logger] = None):
         """
         Args:
             point_cloud: (N, 3) numpy array of points
@@ -84,7 +144,7 @@ class ObjectGSModel(nn.Module):
             voxel_size: Voxel size for anchor creation
             k: Number of Gaussians per anchor
             feature_dim: Anchor feature dimension
-            object_names: List of object names (e.g., ["bed", "dresser", ...])
+            object_names: List of object names
             logger: Optional logger
         """
         super().__init__()
@@ -102,22 +162,11 @@ class ObjectGSModel(nn.Module):
         
         self.num_objects = int(object_ids.max()) + 1
         self.object_names = object_names or [f"object_{i}" for i in range(self.num_objects)]
-        self.object_names[0] = "background"  # ID 0 is always background
+        if len(self.object_names) > 0:
+            self.object_names[0] = "background"
         
         if self.logger:
-            self.logger.info("=" * 70)
-            self.logger.info("INITIALIZING ObjectGSModel WITH SEMANTICS")
-            self.logger.info("=" * 70)
-            self.logger.info(f"Input points: {len(point_cloud):,}")
-            self.logger.info(f"Voxel size: {voxel_size}")
-            self.logger.info(f"k (Gaussians/anchor): {k}")
-            self.logger.info(f"Feature dim: {feature_dim}")
-            self.logger.info(f"Number of objects: {self.num_objects}")
-            for i, name in enumerate(self.object_names[:10]):
-                count = np.sum(object_ids == i)
-                self.logger.info(f"  ID {i}: {name} ({count:,} points)")
-            if self.num_objects > 10:
-                self.logger.info(f"  ... and {self.num_objects - 10} more")
+            self._log_init_info(point_cloud, object_ids)
         
         # Voxelize with semantic voting
         anchor_positions, anchor_colors, anchor_object_ids = self._voxelize(
@@ -125,47 +174,109 @@ class ObjectGSModel(nn.Module):
         )
         
         num_anchors = len(anchor_positions)
-        if self.logger:
-            self.logger.info(f"Created {num_anchors:,} anchors → {num_anchors * k:,} Gaussians")
-            
-            # Log anchor distribution per object
-            unique, counts = np.unique(anchor_object_ids, return_counts=True)
-            self.logger.info("Anchors per object:")
-            for obj_id, count in zip(unique, counts):
-                name = self.object_names[obj_id] if obj_id < len(self.object_names) else f"object_{obj_id}"
-                self.logger.info(f"  {name}: {count:,} anchors ({count * k:,} Gaussians)")
         
-        # Fixed buffers
-        self.register_buffer('anchor_positions', torch.tensor(anchor_positions, dtype=torch.float32))
-        self.register_buffer('anchor_colors', torch.tensor(anchor_colors, dtype=torch.float32))
-        self.register_buffer('anchor_object_ids', torch.tensor(anchor_object_ids, dtype=torch.long))
+        if self.logger:
+            self._log_anchor_info(anchor_object_ids, num_anchors)
+        
+        # =====================================================================
+        # DYNAMIC ANCHOR STORAGE (can grow/prune)
+        # =====================================================================
+        
+        # Anchor positions - fixed (offsets are learnable)
+        self.anchor_positions = nn.Parameter(
+            torch.tensor(anchor_positions, dtype=torch.float32),
+            requires_grad=False
+        )
+        
+        # Anchor colors - buffer (used as baseline for Gaussian colors)
+        self.register_buffer(
+            'anchor_colors', 
+            torch.tensor(anchor_colors, dtype=torch.float32)
+        )
+        
+        # Anchor object IDs - buffer
+        self.register_buffer(
+            'anchor_object_ids',
+            torch.tensor(anchor_object_ids, dtype=torch.long)
+        )
         
         # Learnable parameters
-        features_init = torch.randn(num_anchors, feature_dim) * 0.1
-        features_init[:, :3] = self.anchor_colors
-        self.anchor_features = nn.Parameter(features_init)
+        self.anchor_features = nn.Parameter(
+            self._init_features(anchor_colors, num_anchors)
+        )
         
         self.anchor_scalings = nn.Parameter(torch.ones(num_anchors))
-        self.anchor_offsets = nn.Parameter(torch.randn(num_anchors, k, 3) * 0.01)
         
-        # Pre-expanded buffers for Gaussians
-        expanded_colors = self.anchor_colors.unsqueeze(1).expand(-1, k, -1).reshape(-1, 3)
-        self.register_buffer('gaussian_anchor_colors', expanded_colors)
+        self.anchor_offsets = nn.Parameter(
+            torch.randn(num_anchors, k, 3) * 0.01
+        )
         
-        expanded_obj_ids = self.anchor_object_ids.unsqueeze(1).expand(-1, k).reshape(-1)
-        self.register_buffer('gaussian_object_ids', expanded_obj_ids)
+        # =====================================================================
+        # TRACKING FOR GROW/PRUNE
+        # =====================================================================
         
-        # Attribute MLP
-        self.attribute_mlp = AttributeMLP(feature_dim=feature_dim, k=k)
+        self.register_buffer(
+            'anchor_gradient_accum',
+            torch.zeros(num_anchors)
+        )
+        self.register_buffer(
+            'anchor_gradient_count',
+            torch.zeros(num_anchors, dtype=torch.int32)
+        )
+        
+        # View-dependent attribute MLP
+        self.attribute_mlp = ViewDependentAttributeMLP(
+            feature_dim=feature_dim, k=k, view_dim=4
+        )
         self._init_mlp()
         
-        self.num_anchors = num_anchors
-        self.num_gaussians = num_anchors * k
+        # Track counts
+        self._num_anchors = num_anchors
+        self._num_gaussians = num_anchors * k
         
         if self.logger:
             self.logger.info("=" * 70)
     
-    def _voxelize(self, points, colors, object_ids):
+    @property
+    def num_anchors(self) -> int:
+        return self._num_anchors
+    
+    @property
+    def num_gaussians(self) -> int:
+        return self._num_gaussians
+    
+    def _log_init_info(self, point_cloud, object_ids):
+        self.logger.info("=" * 70)
+        self.logger.info("INITIALIZING ObjectGSModel")
+        self.logger.info("=" * 70)
+        self.logger.info(f"Input points: {len(point_cloud):,}")
+        self.logger.info(f"Voxel size: {self.voxel_size}")
+        self.logger.info(f"k (Gaussians/anchor): {self.k}")
+        self.logger.info(f"Feature dim: {self.feature_dim}")
+        self.logger.info(f"Number of objects: {self.num_objects}")
+        for i, name in enumerate(self.object_names[:10]):
+            count = np.sum(object_ids == i)
+            self.logger.info(f"  ID {i}: {name} ({count:,} points)")
+        if self.num_objects > 10:
+            self.logger.info(f"  ... and {self.num_objects - 10} more")
+    
+    def _log_anchor_info(self, anchor_object_ids, num_anchors):
+        self.logger.info(f"Created {num_anchors:,} anchors → {num_anchors * self.k:,} Gaussians")
+        unique, counts = np.unique(anchor_object_ids, return_counts=True)
+        self.logger.info("Anchors per object:")
+        for obj_id, count in zip(unique[:10], counts[:10]):
+            name = self.object_names[obj_id] if obj_id < len(self.object_names) else f"object_{obj_id}"
+            self.logger.info(f"  {name}: {count:,} anchors ({count * self.k:,} Gaussians)")
+    
+    def _init_features(self, anchor_colors, num_anchors):
+        """Initialize anchor features with color info embedded"""
+        features = torch.randn(num_anchors, self.feature_dim) * 0.1
+        # Embed color information in first 3 dimensions
+        features[:, :3] = torch.tensor(anchor_colors, dtype=torch.float32)
+        return features
+    
+    def _voxelize(self, points: np.ndarray, colors: np.ndarray, 
+                  object_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Voxelize point cloud with semantic majority voting"""
         voxel_indices = np.floor(points / self.voxel_size).astype(np.int32)
         
@@ -187,10 +298,7 @@ class ObjectGSModel(nn.Module):
             
             # Majority vote for object ID
             ids = np.array(data['object_ids'])
-            if len(ids) > 0:
-                obj_id = int(np.bincount(ids).argmax())
-            else:
-                obj_id = 0
+            obj_id = int(np.bincount(ids).argmax()) if len(ids) > 0 else 0
             
             anchor_positions.append(pos)
             anchor_colors.append(avg_color)
@@ -201,56 +309,108 @@ class ObjectGSModel(nn.Module):
                 np.array(anchor_object_ids))
     
     def _init_mlp(self):
-        """Initialize MLP weights"""
+        """Initialize MLP weights for stable training"""
         with torch.no_grad():
+            # Scale: start small
             scale_out = self.attribute_mlp.scale_mlp[-1]
             scale_out.bias.data.fill_(-4.0)
             scale_out.weight.data *= 0.1
             
+            # Opacity: start slightly negative (low opacity initially)
             opacity_out = self.attribute_mlp.opacity_mlp[-1]
-            opacity_out.bias.data.fill_(-2.2)
+            opacity_out.bias.data.fill_(-2.0)
             opacity_out.weight.data *= 0.1
             
-            color_out = self.attribute_mlp.color_mlp[-1]
-            color_out.weight.data *= 2.0
-            color_out.bias.data.zero_()
-            
+            # Rotation: identity quaternion
             rot_out = self.attribute_mlp.rotation_mlp[-1]
             rot_out.bias.data.zero_()
-            rot_out.bias.data[3::4] = 1.0
+            rot_out.bias.data[3::4] = 1.0  # w component
+            
+            # Color delta: start at zero delta (output centered at 0.5 after tanh transform)
+            color_out = self.attribute_mlp.color_mlp[-1]
+            color_out.weight.data *= 0.1
+            color_out.bias.data.zero_()
     
-    def get_parameters_as_tensors(self, object_mask=None):
+    # =========================================================================
+    # CORE FORWARD PASS
+    # =========================================================================
+    
+    def compute_view_info(self, camera_center: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute view direction and distance for each anchor.
+        
+        Args:
+            camera_center: [3] camera position in world coordinates
+        
+        Returns:
+            view_dirs: [N, 3] unit vectors from anchor to camera
+            view_dists: [N, 1] normalized distances
+        """
+        # Direction from anchor to camera
+        dirs = camera_center.unsqueeze(0) - self.anchor_positions  # [N, 3]
+        dists = dirs.norm(dim=-1, keepdim=True)  # [N, 1]
+        
+        # Normalize direction
+        view_dirs = dirs / (dists + 1e-8)  # [N, 3]
+        
+        # Normalize distance (log scale for stability)
+        view_dists = torch.log(dists + 1e-8) / 10.0  # [N, 1]
+        
+        return view_dirs, view_dists
+    
+    def get_parameters_as_tensors(self, camera_center: Optional[torch.Tensor] = None,
+                                   object_mask: Optional[List[int]] = None) -> Dict:
         """
         Get all Gaussian parameters.
         
         Args:
-            object_mask: Optional list of object IDs to include.
-                        If None, returns all Gaussians.
-                        e.g., [1, 2] returns only Gaussians from objects 1 and 2
+            camera_center: [3] camera position for view-dependent colors
+            object_mask: Optional list of object IDs to include
         
         Returns:
             Dictionary of Gaussian parameters
         """
-        # Compute positions
-        positions = (self.anchor_positions.unsqueeze(1) + 
-                    self.anchor_offsets * self.anchor_scalings.unsqueeze(1).unsqueeze(2))
+        # Compute view info if camera provided
+        if camera_center is not None:
+            view_dirs, view_dists = self.compute_view_info(camera_center)
+        else:
+            view_dirs, view_dists = None, None
+        
+        # Compute positions from anchors + offsets
+        positions = (
+            self.anchor_positions.unsqueeze(1) + 
+            self.anchor_offsets * self.anchor_scalings.unsqueeze(1).unsqueeze(2)
+        )
         positions = positions.reshape(-1, 3)
         
-        # MLP forward
-        opacity_raw, scale_raw, rotation, color_delta = self.attribute_mlp(self.anchor_features)
+        # MLP forward with view dependence
+        opacity_raw, scale_raw, rotation, color_delta = self.attribute_mlp(
+            self.anchor_features, view_dirs, view_dists
+        )
         
-        # Flatten
+        # Flatten from [N_anchors, k, ...] to [N_gaussians, ...]
         opacity_raw = opacity_raw.reshape(-1, 1)
         scale_raw = scale_raw.reshape(-1, 3)
         rotation = rotation.reshape(-1, 4)
         color_delta = color_delta.reshape(-1, 3)
         
-        # Final color
-        color = self.gaussian_anchor_colors + (color_delta - 0.5) * 1.0
+        # =====================================================================
+        # COLOR: Anchor color baseline + learned delta
+        # This ensures colors start from the point cloud and MLP learns adjustments
+        # =====================================================================
+        anchor_colors_expanded = self.anchor_colors.unsqueeze(1).expand(-1, self.k, -1).reshape(-1, 3)
+        
+        # color_delta is in [0, 1] range (from tanh * 0.5 + 0.5)
+        # Convert to adjustment: (delta - 0.5) gives us [-0.5, 0.5] range
+        # Scale by factor to control adjustment magnitude
+        color = anchor_colors_expanded + (color_delta - 0.5) * 0.5
         color = torch.clamp(color, 0, 1)
         
-        # Semantics
-        semantics = F.one_hot(self.gaussian_object_ids, num_classes=self.num_objects).float()
+        # Expand object IDs to Gaussians
+        gaussian_object_ids = self.anchor_object_ids.unsqueeze(1).expand(-1, self.k).reshape(-1)
+        
+        # One-hot semantics
+        semantics = F.one_hot(gaussian_object_ids, num_classes=self.num_objects).float()
         
         result = {
             'pos': positions,
@@ -259,12 +419,12 @@ class ObjectGSModel(nn.Module):
             'rotation': rotation,
             'color': color,
             'color_delta': color_delta,
-            'anchor_colors': self.gaussian_anchor_colors,
-            'object_ids': self.gaussian_object_ids,
+            'anchor_colors': anchor_colors_expanded,
+            'object_ids': gaussian_object_ids,
             'semantics': semantics,
-            'num_gaussians': self.num_gaussians,
-            'num_anchors': self.num_anchors,
-            'num_objects': self.num_objects
+            'num_gaussians': self._num_gaussians,
+            'num_anchors': self._num_anchors,
+            'num_objects': self.num_objects,
         }
         
         # Apply object mask if specified
@@ -273,13 +433,15 @@ class ObjectGSModel(nn.Module):
         
         return result
     
-    def _apply_object_mask(self, params, object_ids_to_keep):
+    def _apply_object_mask(self, params: Dict, object_ids_to_keep: List[int]) -> Dict:
         """Filter parameters to only include specified objects"""
-        mask = torch.zeros(self.num_gaussians, dtype=torch.bool, device=self.gaussian_object_ids.device)
-        for obj_id in object_ids_to_keep:
-            mask |= (self.gaussian_object_ids == obj_id)
+        device = params['object_ids'].device
+        mask = torch.zeros(params['num_gaussians'], dtype=torch.bool, device=device)
         
-        filtered = {
+        for obj_id in object_ids_to_keep:
+            mask |= (params['object_ids'] == obj_id)
+        
+        return {
             'pos': params['pos'][mask],
             'opacity_raw': params['opacity_raw'][mask],
             'scale_raw': params['scale_raw'][mask],
@@ -290,87 +452,316 @@ class ObjectGSModel(nn.Module):
             'object_ids': params['object_ids'][mask],
             'semantics': params['semantics'][mask],
             'num_gaussians': mask.sum().item(),
-            'num_anchors': self.num_anchors,  # Original count
+            'num_anchors': self._num_anchors,
             'num_objects': self.num_objects,
-            'object_mask': mask,  # Include mask for reference
+            'object_mask': mask,
         }
-        return filtered
     
-    def get_object_gaussians(self, object_id):
-        """Get parameters for a single object"""
-        return self.get_parameters_as_tensors(object_mask=[object_id])
+    # =========================================================================
+    # ANCHOR GROWING AND PRUNING
+    # =========================================================================
     
-    def get_object_stats(self):
-        """Get statistics per object"""
-        stats = {}
-        for obj_id in range(self.num_objects):
-            mask = self.gaussian_object_ids == obj_id
-            count = mask.sum().item()
-            name = self.object_names[obj_id] if obj_id < len(self.object_names) else f"object_{obj_id}"
+    def update_gradient_stats(self, viewspace_gradients: torch.Tensor, 
+                               visibility_mask: torch.Tensor):
+        """
+        Accumulate gradient statistics for densification decisions.
+        
+        Called after each training step.
+        
+        Args:
+            viewspace_gradients: Gradients of Gaussian positions in view space
+            visibility_mask: Boolean mask of which Gaussians were visible
+        """
+        # Convert Gaussian-level stats to anchor-level
+        grad_norms = viewspace_gradients.norm(dim=-1)  # [N_gaussians]
+        
+        # Reshape to [N_anchors, k] and take mean per anchor
+        grad_norms = grad_norms.reshape(self._num_anchors, self.k)
+        visibility = visibility_mask.reshape(self._num_anchors, self.k)
+        
+        # Mean gradient per anchor (only for visible Gaussians)
+        visible_count = visibility.sum(dim=1).clamp(min=1)
+        anchor_grads = (grad_norms * visibility.float()).sum(dim=1) / visible_count
+        
+        # Any anchor with at least one visible Gaussian
+        anchor_visible = visibility.any(dim=1)
+        
+        # Accumulate
+        self.anchor_gradient_accum[anchor_visible] += anchor_grads[anchor_visible]
+        self.anchor_gradient_count[anchor_visible] += 1
+    
+    def reset_gradient_stats(self):
+        """Reset gradient accumulators after densification"""
+        self.anchor_gradient_accum.zero_()
+        self.anchor_gradient_count.zero_()
+    
+    def densify_and_prune(self, 
+                          grad_threshold: float = 0.0002,
+                          opacity_threshold: float = 0.005,
+                          scale_threshold: float = 0.01,
+                          max_screen_size: Optional[float] = None,
+                          min_opacity: float = 0.005) -> Dict:
+        """
+        Perform anchor densification (growing) and pruning.
+        
+        This is the key dynamic adaptation mechanism from Scaffold-GS.
+        
+        Args:
+            grad_threshold: Gradient threshold for densification
+            opacity_threshold: Minimum opacity to keep anchor
+            scale_threshold: Scale threshold for splitting vs cloning
+            max_screen_size: Maximum screen-space size (optional)
+            min_opacity: Minimum opacity to keep
+        
+        Returns:
+            Dictionary with statistics about the operation
+        """
+        stats = {
+            'anchors_before': self._num_anchors,
+            'pruned': 0,
+            'grown': 0,
+        }
+        
+        with torch.no_grad():
+            # Get current opacities
+            opacity_raw, _, _, _ = self.attribute_mlp(self.anchor_features, None, None)
+            anchor_opacities = torch.sigmoid(opacity_raw).mean(dim=1)  # Mean over k Gaussians
             
-            if count > 0:
-                positions = (self.anchor_positions.unsqueeze(1) + 
-                            self.anchor_offsets * self.anchor_scalings.unsqueeze(1).unsqueeze(2))
-                positions = positions.reshape(-1, 3)[mask]
-                
-                stats[obj_id] = {
-                    'name': name,
-                    'num_gaussians': count,
-                    'center': positions.mean(dim=0).cpu().numpy(),
-                    'bbox_min': positions.min(dim=0)[0].cpu().numpy(),
-                    'bbox_max': positions.max(dim=0)[0].cpu().numpy(),
-                }
+            # Average gradients
+            avg_grads = self.anchor_gradient_accum / self.anchor_gradient_count.clamp(min=1)
+            
+            # ===== PRUNING =====
+            prune_mask = anchor_opacities < min_opacity
+            stats['pruned'] = prune_mask.sum().item()
+            
+            # ===== GROWING =====
+            grow_mask = avg_grads > grad_threshold
+            grow_mask &= ~prune_mask  # Don't grow anchors we're about to prune
+            stats['grown'] = grow_mask.sum().item()
+            
+            # ===== APPLY CHANGES =====
+            if stats['pruned'] > 0 or stats['grown'] > 0:
+                self._apply_densification(prune_mask, grow_mask)
+            
+            # Reset stats
+            self.reset_gradient_stats()
+        
+        stats['anchors_after'] = self._num_anchors
+        
+        if self.logger:
+            self.logger.info(
+                f"Densification: {stats['anchors_before']} → {stats['anchors_after']} anchors "
+                f"(pruned {stats['pruned']}, grew {stats['grown']})"
+            )
         
         return stats
     
-    def get_optimizer_param_groups(self, config):
+    def _apply_densification(self, prune_mask: torch.Tensor, grow_mask: torch.Tensor):
+        """
+        Apply pruning and growing to anchor tensors.
+        """
+        device = self.anchor_positions.device
+        
+        # Keep mask (inverse of prune)
+        keep_mask = ~prune_mask
+        
+        # Indices of anchors to grow (in original indexing)
+        grow_indices = torch.where(grow_mask & keep_mask)[0]
+        
+        # New anchor count
+        n_keep = keep_mask.sum().item()
+        n_grow = len(grow_indices)
+        new_n_anchors = n_keep + n_grow
+        
+        if new_n_anchors == 0:
+            if self.logger:
+                self.logger.warning("Densification would remove all anchors, skipping")
+            return
+        
+        # ===== GATHER KEPT ANCHORS =====
+        new_positions = self.anchor_positions.data[keep_mask]
+        new_colors = self.anchor_colors[keep_mask]
+        new_object_ids = self.anchor_object_ids[keep_mask]
+        new_features = self.anchor_features.data[keep_mask]
+        new_scalings = self.anchor_scalings.data[keep_mask]
+        new_offsets = self.anchor_offsets.data[keep_mask]
+        
+        # ===== ADD GROWN ANCHORS =====
+        if n_grow > 0:
+            # Map grow_indices to their position in the kept array
+            kept_indices = torch.where(keep_mask)[0]
+            
+            grow_in_kept = []
+            for gi in grow_indices:
+                match = (kept_indices == gi).nonzero(as_tuple=True)[0]
+                if len(match) > 0:
+                    grow_in_kept.append(match[0].item())
+            
+            if len(grow_in_kept) > 0:
+                grow_in_kept = torch.tensor(grow_in_kept, device=device)
+                
+                # Clone with small perturbation
+                grown_positions = new_positions[grow_in_kept] + torch.randn(len(grow_in_kept), 3, device=device) * self.voxel_size * 0.1
+                grown_colors = new_colors[grow_in_kept]
+                grown_object_ids = new_object_ids[grow_in_kept]
+                grown_features = new_features[grow_in_kept] + torch.randn(len(grow_in_kept), self.feature_dim, device=device) * 0.01
+                grown_scalings = new_scalings[grow_in_kept]
+                grown_offsets = new_offsets[grow_in_kept] + torch.randn(len(grow_in_kept), self.k, 3, device=device) * 0.001
+                
+                # Concatenate
+                new_positions = torch.cat([new_positions, grown_positions], dim=0)
+                new_colors = torch.cat([new_colors, grown_colors], dim=0)
+                new_object_ids = torch.cat([new_object_ids, grown_object_ids], dim=0)
+                new_features = torch.cat([new_features, grown_features], dim=0)
+                new_scalings = torch.cat([new_scalings, grown_scalings], dim=0)
+                new_offsets = torch.cat([new_offsets, grown_offsets], dim=0)
+        
+        # ===== UPDATE MODEL PARAMETERS =====
+        self.anchor_positions = nn.Parameter(new_positions, requires_grad=False)
+        self.register_buffer('anchor_colors', new_colors)
+        self.register_buffer('anchor_object_ids', new_object_ids)
+        self.anchor_features = nn.Parameter(new_features)
+        self.anchor_scalings = nn.Parameter(new_scalings)
+        self.anchor_offsets = nn.Parameter(new_offsets)
+        
+        # Update gradient tracking buffers
+        self.register_buffer('anchor_gradient_accum', torch.zeros(new_n_anchors, device=device))
+        self.register_buffer('anchor_gradient_count', torch.zeros(new_n_anchors, dtype=torch.int32, device=device))
+        
+        # Update counts
+        self._num_anchors = new_n_anchors
+        self._num_gaussians = new_n_anchors * self.k
+    
+    def prune_low_opacity(self, min_opacity: float = 0.01) -> int:
+        """
+        Simple pruning: remove anchors where all Gaussians have low opacity.
+        
+        Returns:
+            Number of pruned anchors
+        """
+        with torch.no_grad():
+            opacity_raw, _, _, _ = self.attribute_mlp(self.anchor_features, None, None)
+            anchor_opacities = torch.sigmoid(opacity_raw).max(dim=1)[0]
+            
+            prune_mask = anchor_opacities < min_opacity
+            n_prune = prune_mask.sum().item()
+            
+            if n_prune > 0 and n_prune < self._num_anchors:
+                grow_mask = torch.zeros_like(prune_mask)
+                self._apply_densification(prune_mask, grow_mask)
+            
+            return n_prune
+    
+    # =========================================================================
+    # OPTIMIZER HELPERS
+    # =========================================================================
+    
+    def get_optimizer_param_groups(self, config: Dict) -> List[Dict]:
         """Get parameter groups for optimizer"""
         return [
-            {'params': [self.anchor_features], 'lr': config.get('lr_feature', 0.0025), 'name': 'features'},
-            {'params': [self.anchor_scalings], 'lr': config.get('lr_scaling', 0.005), 'name': 'scalings'},
-            {'params': [self.anchor_offsets], 'lr': config.get('lr_position', 0.00016), 'name': 'offsets'},
-            {'params': self.attribute_mlp.parameters(), 'lr': config.get('lr', 0.001), 'name': 'mlp'}
+            {
+                'params': [self.anchor_features], 
+                'lr': config.get('lr_feature', 0.0025), 
+                'name': 'features'
+            },
+            {
+                'params': [self.anchor_scalings], 
+                'lr': config.get('lr_scaling', 0.005), 
+                'name': 'scalings'
+            },
+            {
+                'params': [self.anchor_offsets], 
+                'lr': config.get('lr_position', 0.00016), 
+                'name': 'offsets'
+            },
+            {
+                'params': self.attribute_mlp.parameters(), 
+                'lr': config.get('lr', 0.001), 
+                'name': 'mlp'
+            }
         ]
     
-    # =========================================================================
-    # OBJECT MANIPULATION METHODS
-    # =========================================================================
-    
-    def hide_object(self, object_id):
+    def get_optimizer_param_groups_after_densify(self, optimizer: torch.optim.Optimizer, 
+                                                   config: Dict) -> torch.optim.Optimizer:
         """
-        'Hide' an object by zeroing its opacity (non-destructive).
-        Note: This modifies the model state. Call unhide_object to restore.
+        Recreate optimizer after densification changes parameter shapes.
         """
-        if not hasattr(self, '_hidden_objects'):
-            self._hidden_objects = set()
-        self._hidden_objects.add(object_id)
+        new_optimizer = torch.optim.Adam(self.get_optimizer_param_groups(config))
+        return new_optimizer
     
-    def unhide_object(self, object_id):
-        """Restore a hidden object"""
-        if hasattr(self, '_hidden_objects'):
-            self._hidden_objects.discard(object_id)
+    # =========================================================================
+    # OBJECT MANIPULATION
+    # =========================================================================
     
-    def get_visible_parameters(self):
-        """Get parameters excluding hidden objects"""
-        if not hasattr(self, '_hidden_objects') or len(self._hidden_objects) == 0:
-            return self.get_parameters_as_tensors()
+    def get_object_gaussians(self, object_id: int) -> Dict:
+        """Get parameters for a single object"""
+        return self.get_parameters_as_tensors(object_mask=[object_id])
+    
+    def get_object_stats(self) -> Dict:
+        """Get statistics per object"""
+        stats = {}
         
-        visible_objects = [i for i in range(self.num_objects) if i not in self._hidden_objects]
-        return self.get_parameters_as_tensors(object_mask=visible_objects)
+        for obj_id in range(self.num_objects):
+            mask = self.anchor_object_ids == obj_id
+            n_anchors = mask.sum().item()
+            
+            if n_anchors == 0:
+                continue
+            
+            name = self.object_names[obj_id] if obj_id < len(self.object_names) else f"object_{obj_id}"
+            positions = self.anchor_positions[mask]
+            
+            stats[obj_id] = {
+                'name': name,
+                'num_anchors': n_anchors,
+                'num_gaussians': n_anchors * self.k,
+                'center': positions.mean(dim=0).cpu().numpy(),
+                'bbox_min': positions.min(dim=0)[0].cpu().numpy(),
+                'bbox_max': positions.max(dim=0)[0].cpu().numpy(),
+            }
+        
+        return stats
     
-    def export_object_ply(self, object_id, output_path):
-        """Export a single object as a point cloud"""
+    # =========================================================================
+    # EXPORT
+    # =========================================================================
+    
+    def export_object_ply(self, object_id: int, output_path: str, 
+                          min_opacity: float = 0.1):
+        """
+        Export a single object as a point cloud.
+        
+        Args:
+            object_id: Object ID to export
+            output_path: Path to save PLY
+            min_opacity: Minimum opacity threshold for export
+        """
         import open3d as o3d
         
-        params = self.get_object_gaussians(object_id)
-        positions = params['pos'].detach().cpu().numpy()
-        colors = params['color'].detach().cpu().numpy()
+        with torch.no_grad():
+            params = self.get_object_gaussians(object_id)
+            
+            positions = params['pos']
+            colors = params['color']
+            opacities = torch.sigmoid(params['opacity_raw']).squeeze(-1)
+            
+            # Filter by opacity
+            mask = opacities > min_opacity
+            positions = positions[mask].cpu().numpy()
+            colors = colors[mask].cpu().numpy()
+            
+            if len(positions) == 0:
+                if self.logger:
+                    self.logger.warning(f"No Gaussians with opacity > {min_opacity} for object {object_id}")
+                return
         
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(positions)
-        pcd.colors = o3d.utility.Vector3dVector(colors)
+        pcd.colors = o3d.utility.Vector3dVector(np.clip(colors, 0, 1))
         
         o3d.io.write_point_cloud(str(output_path), pcd)
         
         name = self.object_names[object_id] if object_id < len(self.object_names) else f"object_{object_id}"
-        print(f"Exported {name} ({len(positions):,} Gaussians) to {output_path}")
+        
+        if self.logger:
+            self.logger.info(f"Exported {name}: {len(positions):,} Gaussians to {output_path}")
