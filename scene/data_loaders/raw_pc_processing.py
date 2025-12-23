@@ -1,268 +1,323 @@
 """
 Multiview point cloud filtering utilities with semantic support.
-Handles points, colors, AND object IDs throughout the pipeline.
+
+Key behavior (semantic-preserving):
+- ID 0 is treated as "unlabeled/background".
+- If a voxel has enough non-zero evidence, background (0) cannot outvote it.
+- If a voxel does NOT have enough non-zero evidence, it falls back to 0.
+
+This prevents "sometimes-correct labels" (clothes/books/walls) from being erased by many unlabeled votes.
 """
 
-import open3d as o3d
+from __future__ import annotations
+
 import numpy as np
+import open3d as o3d
 from collections import defaultdict
-from tqdm import tqdm
 from sklearn.cluster import DBSCAN
 
 
-def create_o3d_pointcloud(points, colors):
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def create_o3d_pointcloud(points: np.ndarray, colors: np.ndarray) -> o3d.geometry.PointCloud:
     """Create Open3D point cloud from numpy arrays."""
     pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    pcd.colors = o3d.utility.Vector3dVector(colors)
+    if len(points) == 0:
+        return pcd
+    pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+    if colors is not None and len(colors) == len(points):
+        pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
     return pcd
 
 
-def majority_vote(ids):
-    """Safely compute majority vote for object IDs."""
-    if len(ids) == 0:
+def _argmax_bincount(ids: np.ndarray) -> int:
+    """Fast argmax over non-negative int ids."""
+    if ids.size == 0:
         return 0
-    ids = np.asarray(ids, dtype=np.int32)
-    if ids.min() < 0:
-        offset = -ids.min()
-        ids = ids + offset
-        voted = np.bincount(ids).argmax() - offset
-    else:
-        voted = np.bincount(ids).argmax()
-    return int(voted)
+    ids = ids.astype(np.int32, copy=False)
+    return int(np.bincount(ids).argmax())
 
 
-def per_frame_voxel_downsample_with_semantics(points_by_frame, colors_by_frame, 
-                                               object_ids_by_frame, voxel_size):
-    """Voxelize each frame individually, preserving object IDs via voting."""
-    downsampled_points = []
-    downsampled_colors = []
-    downsampled_object_ids = []
-    
-    print(f"Voxelizing {len(points_by_frame)} frames with semantics (voxel size: {voxel_size}m)...")
-    
-    for points, colors, obj_ids in tqdm(zip(points_by_frame, colors_by_frame, object_ids_by_frame),
-                                         total=len(points_by_frame)):
-        if len(points) == 0:
-            continue
-            
-        voxel_indices = np.floor(points / voxel_size).astype(np.int32)
-        
-        voxel_dict = defaultdict(lambda: {'points': [], 'colors': [], 'object_ids': []})
-        for i, vidx in enumerate(voxel_indices):
-            key = tuple(vidx)
-            voxel_dict[key]['points'].append(points[i])
-            voxel_dict[key]['colors'].append(colors[i])
-            voxel_dict[key]['object_ids'].append(obj_ids[i])
-        
-        frame_points = []
-        frame_colors = []
-        frame_obj_ids = []
-        
-        for data in voxel_dict.values():
-            frame_points.append(np.mean(data['points'], axis=0))
-            frame_colors.append(np.mean(data['colors'], axis=0))
-            voted_id = majority_vote(data['object_ids'])
-            frame_obj_ids.append(voted_id)
-        
-        if len(frame_points) > 0:
-            downsampled_points.append(np.array(frame_points))
-            downsampled_colors.append(np.array(frame_colors))
-            downsampled_object_ids.append(np.array(frame_obj_ids, dtype=np.int32))
-    
-    return downsampled_points, downsampled_colors, downsampled_object_ids
+def vote_object_id(
+    ids: np.ndarray,
+    *,
+    background_id: int = 0,
+    prefer_nonzero: bool = True,
+    min_nonzero_votes: int = 2,
+    min_nonzero_ratio: float = 0.30,
+) -> int:
+    """
+    Vote a single object id from a set of per-point ids.
+
+    If prefer_nonzero=True:
+      - If we have enough non-zero evidence, vote ONLY among non-zero ids.
+      - Else return background_id.
+
+    This matches "only truly unlabeled should become background".
+    """
+    if ids.size == 0:
+        return background_id
+
+    ids = ids.astype(np.int32, copy=False)
+
+    if not prefer_nonzero:
+        return _argmax_bincount(ids)
+
+    nonzero = ids[ids != background_id]
+    nz = int(nonzero.size)
+
+    if nz < min_nonzero_votes:
+        return background_id
+
+    # Ratio is with respect to total observations in voxel
+    ratio = nz / float(ids.size)
+    if ratio < min_nonzero_ratio:
+        return background_id
+
+    # Vote among non-zero only
+    # Need bincount on shifted ids or mask out background in bincount:
+    # easiest: bincount full, then zero out background bin.
+    bc = np.bincount(ids)
+    if background_id < bc.size:
+        bc[background_id] = 0
+    return int(bc.argmax())
 
 
-def multiview_filter_with_semantics(points_by_frame, colors_by_frame, 
-                                     object_ids_by_frame, voxel_size, min_views):
-    """Filter points using multiview consistency, with object ID voting."""
+# -----------------------------
+# Core: voxel multiview filtering
+# -----------------------------
+
+def multiview_filter_with_semantics(
+    points_by_frame: list[np.ndarray],
+    colors_by_frame: list[np.ndarray],
+    object_ids_by_frame: list[np.ndarray],
+    *,
+    voxel_size: float = 0.01,
+    min_views: int = 5,
+    prefer_nonzero: bool = True,
+    min_nonzero_votes: int = 2,
+    min_nonzero_ratio: float = 0.30,
+    background_id: int = 0,
+    aggregate: str = "mean",  # "mean" or "medoid"
+):
+    """
+    Combine per-frame points into voxels, require visibility in >=min_views frames,
+    and produce one representative point per voxel with a voted object ID.
+
+    Semantics:
+      - background_id (0) treated as unlabeled/background.
+      - If prefer_nonzero=True, labeled evidence is preserved.
+    """
+    assert len(points_by_frame) == len(colors_by_frame) == len(object_ids_by_frame)
+
     voxel_data = defaultdict(lambda: {
-        'frames': set(), 'points': [], 'colors': [], 'object_ids': []
+        "frames": set(),
+        "points": [],
+        "colors": [],
+        "ids": [],
     })
-    
-    print(f"Accumulating votes across {len(points_by_frame)} frames...")
-    for frame_id, (points, colors, obj_ids) in enumerate(tqdm(
-            zip(points_by_frame, colors_by_frame, object_ids_by_frame),
-            total=len(points_by_frame))):
-        
-        if len(points) == 0:
+
+    for frame_id, (pts, cols, ids) in enumerate(zip(points_by_frame, colors_by_frame, object_ids_by_frame)):
+        if pts is None or len(pts) == 0:
             continue
-        
-        voxel_coords = np.floor(points / voxel_size).astype(np.int32)
-        
-        for i, voxel_key in enumerate(map(tuple, voxel_coords)):
-            voxel_data[voxel_key]['frames'].add(frame_id)
-            voxel_data[voxel_key]['points'].append(points[i])
-            voxel_data[voxel_key]['colors'].append(colors[i])
-            voxel_data[voxel_key]['object_ids'].append(obj_ids[i])
-    
+        if cols is None or len(cols) != len(pts):
+            raise ValueError(f"Frame {frame_id}: colors missing or wrong shape.")
+        if ids is None or len(ids) != len(pts):
+            raise ValueError(f"Frame {frame_id}: object_ids missing or wrong shape.")
+
+        # voxel coordinates
+        vox = np.floor(pts / float(voxel_size)).astype(np.int32)
+
+        for i, key in enumerate(map(tuple, vox)):
+            d = voxel_data[key]
+            d["frames"].add(frame_id)
+            d["points"].append(pts[i])
+            d["colors"].append(cols[i])
+            d["ids"].append(int(ids[i]))
+
     print(f"Filtering voxels (min views: {min_views})...")
-    filtered_points = []
-    filtered_colors = []
-    filtered_object_ids = []
-    
-    for data in voxel_data.values():
-        if len(data['frames']) >= min_views:
-            filtered_points.append(np.mean(data['points'], axis=0))
-            filtered_colors.append(np.mean(data['colors'], axis=0))
-            voted_id = majority_vote(data['object_ids'])
-            filtered_object_ids.append(voted_id)
-    
-    total_voxels = len(voxel_data)
-    kept_voxels = len(filtered_points)
-    
-    if total_voxels > 0:
-        print(f"Kept {kept_voxels:,} / {total_voxels:,} voxels ({100*kept_voxels/total_voxels:.1f}%)")
-    
-    if len(filtered_points) == 0:
-        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0, dtype=np.int32)
-    
-    return (np.array(filtered_points), 
-            np.array(filtered_colors), 
-            np.array(filtered_object_ids, dtype=np.int32))
 
+    out_points = []
+    out_colors = []
+    out_ids = []
 
-def statistical_outlier_removal_with_semantics(points, colors, object_ids,
-                                                nb_neighbors=20, std_ratio=2.0):
-    """Remove statistical outliers while preserving object IDs."""
-    if len(points) == 0:
-        return points, colors, object_ids
-        
-    print(f"Applying statistical outlier removal (neighbors={nb_neighbors}, std_ratio={std_ratio})...")
-    
-    pcd = create_o3d_pointcloud(points, colors)
-    pcd_clean, indices = pcd.remove_statistical_outlier(
-        nb_neighbors=nb_neighbors, std_ratio=std_ratio
+    for d in voxel_data.values():
+        if len(d["frames"]) < min_views:
+            continue
+
+        pts = np.asarray(d["points"], dtype=np.float32)
+        cols = np.asarray(d["colors"], dtype=np.float32)
+        ids = np.asarray(d["ids"], dtype=np.int32)
+
+        voted = vote_object_id(
+            ids,
+            background_id=background_id,
+            prefer_nonzero=prefer_nonzero,
+            min_nonzero_votes=min_nonzero_votes,
+            min_nonzero_ratio=min_nonzero_ratio,
+        )
+
+        if aggregate == "mean":
+            rep_p = pts.mean(axis=0)
+            rep_c = cols.mean(axis=0)
+        elif aggregate == "medoid":
+            # pick point closest to centroid
+            centroid = pts.mean(axis=0, keepdims=True)
+            j = int(np.argmin(np.sum((pts - centroid) ** 2, axis=1)))
+            rep_p = pts[j]
+            rep_c = cols[j]
+        else:
+            raise ValueError("aggregate must be 'mean' or 'medoid'")
+
+        out_points.append(rep_p)
+        out_colors.append(rep_c)
+        out_ids.append(voted)
+
+    if len(out_points) == 0:
+        return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32), np.zeros((0,), np.int32)
+
+    return (
+        np.asarray(out_points, dtype=np.float32),
+        np.asarray(out_colors, dtype=np.float32),
+        np.asarray(out_ids, dtype=np.int32),
     )
-    
-    indices = np.array(indices)
-    clean_points = np.asarray(pcd_clean.points)
-    clean_colors = np.asarray(pcd_clean.colors)
-    clean_object_ids = object_ids[indices]
-    
-    removed = len(points) - len(clean_points)
-    print(f"Removed {removed:,} outliers ({100*removed/len(points):.1f}%)")
-    
-    return clean_points, clean_colors, clean_object_ids
 
 
-def remove_disconnected_clusters_with_semantics(points, colors, object_ids,
-                                                 eps=0.1, min_samples=50,
-                                                 keep_largest_n=1, min_cluster_size=1000):
-    """Remove disconnected clusters while preserving object IDs."""
+# -----------------------------
+# Geometry cleaning (preserve semantics)
+# -----------------------------
+
+def remove_disconnected_clusters(
+    points: np.ndarray,
+    colors: np.ndarray,
+    object_ids: np.ndarray,
+    *,
+    eps: float = 0.10,
+    min_samples: int = 50,
+    keep_largest_n: int = 1,
+):
+    """
+    Remove disconnected geometric clusters using DBSCAN.
+    Semantics are preserved by indexing.
+    """
     if len(points) == 0:
         return points, colors, object_ids
-        
+
     print(f"Removing disconnected clusters (eps={eps}m, min_samples={min_samples})...")
-    
-    clustering = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1)
-    labels = clustering.fit_predict(points)
-    
-    unique_labels = set(labels)
-    unique_labels.discard(-1)
-    
-    print(f"Found {len(unique_labels)} clusters (plus {sum(labels == -1)} noise points)")
-    
-    if len(unique_labels) == 0:
+
+    labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(points)
+    unique = np.unique(labels)
+
+    # Count clusters excluding noise (-1)
+    cluster_labels = [l for l in unique.tolist() if l != -1]
+    cluster_sizes = [(l, int(np.sum(labels == l))) for l in cluster_labels]
+    cluster_sizes.sort(key=lambda x: x[1], reverse=True)
+
+    n_noise = int(np.sum(labels == -1))
+    print(f"Found {len(cluster_labels)} clusters (plus {n_noise} noise points)")
+
+    if len(cluster_sizes) == 0:
+        # Everything is noise; keep it rather than deleting everything.
         return points, colors, object_ids
-    
-    cluster_sizes = {label: sum(labels == label) for label in unique_labels}
-    sorted_clusters = sorted(cluster_sizes.items(), key=lambda x: x[1], reverse=True)
-    
-    keep_labels = set()
-    for label, size in sorted_clusters[:keep_largest_n]:
-        if size >= min_cluster_size:
-            keep_labels.add(label)
-    
-    if len(keep_labels) == 0:
-        keep_labels.add(sorted_clusters[0][0])
-    
-    mask = np.isin(labels, list(keep_labels))
-    
+
+    keep = set([l for l, _ in cluster_sizes[:keep_largest_n]])
+    mask = np.isin(labels, list(keep))
+
     return points[mask], colors[mask], object_ids[mask]
 
 
-def create_filtered_pointcloud_with_semantics(points_by_frame, colors_by_frame, 
-                                               object_ids_by_frame,
-                                               voxel_size=0.01, min_views=3,
-                                               nb_neighbors=20, std_ratio=2.0,
-                                               cluster_eps=0.1, keep_largest_n=1,
-                                               min_cluster_size=1000, use_sor=True):
-    """Full pipeline with semantic preservation."""
-    print(f"\\n{'='*60}")
-    print("CREATING FILTERED POINT CLOUD WITH SEMANTICS")
-    print(f"{'='*60}")
-    
-    if len(points_by_frame) == 0:
-        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0, dtype=np.int32)
-    
-    # Step 1: Per-frame voxelization
-    points_vox, colors_vox, obj_ids_vox = per_frame_voxel_downsample_with_semantics(
-        points_by_frame, colors_by_frame, object_ids_by_frame, voxel_size
-    )
-    
-    total_after_vox = sum(len(p) for p in points_vox) if points_vox else 0
-    print(f"After per-frame voxelization: {total_after_vox:,} points")
-    
-    if total_after_vox == 0:
-        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros(0, dtype=np.int32)
-    
-    # Step 2: Multiview filtering
-    points, colors, object_ids = multiview_filter_with_semantics(
-        points_vox, colors_vox, obj_ids_vox,
-        voxel_size=voxel_size, min_views=min_views
-    )
-    
+def statistical_outlier_removal(
+    points: np.ndarray,
+    colors: np.ndarray,
+    object_ids: np.ndarray,
+    *,
+    nb_neighbors: int = 20,
+    std_ratio: float = 1.5,
+):
+    """Open3D statistical outlier removal. Preserves object_ids by indexing."""
     if len(points) == 0:
         return points, colors, object_ids
-    
-    # Step 3: Clustering
-    points, colors, object_ids = remove_disconnected_clusters_with_semantics(
-        points, colors, object_ids,
-        eps=cluster_eps, min_samples=50,
-        keep_largest_n=keep_largest_n, min_cluster_size=min_cluster_size
-    )
-    
-    # Step 4: Statistical outlier removal
-    if use_sor and len(points) > 0:
-        points, colors, object_ids = statistical_outlier_removal_with_semantics(
-            points, colors, object_ids,
-            nb_neighbors=nb_neighbors, std_ratio=std_ratio
-        )
-    
-    # Print summary
-    if len(object_ids) > 0:
-        unique_ids = np.unique(object_ids)
-        print(f"\\nSemantic summary: {len(unique_ids)} unique objects")
-        for obj_id in unique_ids[:10]:
-            count = np.sum(object_ids == obj_id)
-            print(f"  ID {obj_id}: {count:,} points")
-    
-    return points, colors, object_ids
+
+    print(f"Applying statistical outlier removal (neighbors={nb_neighbors}, std_ratio={std_ratio})...")
+
+    pcd = create_o3d_pointcloud(points, colors)
+    _, ind = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
+
+    ind = np.asarray(ind, dtype=np.int64)
+    removed = len(points) - len(ind)
+    pct = 100.0 * removed / max(1, len(points))
+    print(f"Removed {removed:,} outliers ({pct:.1f}%)")
+
+    return points[ind], colors[ind], object_ids[ind]
 
 
-def create_filtered_pointcloud(points_by_frame, colors_by_frame,
-                                voxel_size=0.01, min_views=3,
-                                nb_neighbors=20, std_ratio=2.0,
-                                cluster_eps=0.1, keep_largest_n=1,
-                                min_cluster_size=1000, use_sor=True):
-    """Legacy version without semantics."""
-    object_ids_by_frame = [np.zeros(len(p), dtype=np.int32) for p in points_by_frame]
-    
-    points, colors, _ = create_filtered_pointcloud_with_semantics(
+# -----------------------------
+# Full pipeline
+# -----------------------------
+
+def process_pointcloud_with_semantics(
+    points_by_frame: list[np.ndarray],
+    colors_by_frame: list[np.ndarray],
+    object_ids_by_frame: list[np.ndarray],
+    *,
+    voxel_size: float = 0.01,
+    min_views: int = 5,
+    prefer_nonzero: bool = True,
+    min_nonzero_votes: int = 2,
+    min_nonzero_ratio: float = 0.30,
+    background_id: int = 0,
+    cluster_eps: float = 0.10,
+    min_cluster_size: int = 50,
+    keep_largest_n: int = 1,
+    use_sor: bool = True,
+    nb_neighbors: int = 20,
+    std_ratio: float = 1.5,
+):
+    """
+    Main processing pipeline:
+      1) multiview voxel filter + semantic voting
+      2) remove disconnected clusters
+      3) optional statistical outlier removal
+      4) print semantic summary
+    """
+    points, colors, obj_ids = multiview_filter_with_semantics(
         points_by_frame, colors_by_frame, object_ids_by_frame,
-        voxel_size=voxel_size, min_views=min_views,
-        nb_neighbors=nb_neighbors, std_ratio=std_ratio,
-        cluster_eps=cluster_eps, keep_largest_n=keep_largest_n,
-        min_cluster_size=min_cluster_size, use_sor=use_sor
+        voxel_size=voxel_size,
+        min_views=min_views,
+        prefer_nonzero=prefer_nonzero,
+        min_nonzero_votes=min_nonzero_votes,
+        min_nonzero_ratio=min_nonzero_ratio,
+        background_id=background_id,
+        aggregate="mean",
     )
-    
-    return points, colors
+
+    points, colors, obj_ids = remove_disconnected_clusters(
+        points, colors, obj_ids,
+        eps=cluster_eps,
+        min_samples=min_cluster_size,
+        keep_largest_n=keep_largest_n,
+    )
+
+    if use_sor:
+        points, colors, obj_ids = statistical_outlier_removal(
+            points, colors, obj_ids,
+            nb_neighbors=nb_neighbors,
+            std_ratio=std_ratio,
+        )
+
+    # Semantic summary
+    uniq, counts = np.unique(obj_ids, return_counts=True)
+    print(f"\nSemantic summary: {len(uniq)} unique objects")
+    for k, c in zip(uniq.tolist(), counts.tolist()):
+        print(f"  ID {k}: {c:,} points")
+
+    return points, colors, obj_ids
 
 
-def create_raw_pointcloud(points_by_frame, colors_by_frame):
-    """Combine all frames into a single raw point cloud."""
+def create_raw_pointcloud(points_by_frame: list[np.ndarray], colors_by_frame: list[np.ndarray]):
+    """Combine all frames into a single raw point cloud (no semantics)."""
     if len(points_by_frame) == 0:
-        return np.zeros((0, 3)), np.zeros((0, 3))
-    
-    return np.vstack(points_by_frame), np.vstack(colors_by_frame)
+        return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32)
+    return np.vstack(points_by_frame).astype(np.float32), np.vstack(colors_by_frame).astype(np.float32)
