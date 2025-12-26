@@ -9,6 +9,75 @@ import json
 import matplotlib.pyplot as plt
 
 
+def load_class_mapping(scene_path):
+    """
+    Load class mapping from scene directory.
+    
+    Tries multiple locations:
+    1. scene_path/class_mapping.json (new format)
+    2. scene_path/EXR_RGBD/masks/object_mapping.json (legacy format)
+    
+    Returns:
+        dict mapping object_id (int) -> {"class_name": str, "instance_id": int}
+    """
+    scene_path = Path(scene_path)
+    
+    # Try new format first
+    mapping_file = scene_path / "class_mapping.json"
+    if mapping_file.exists():
+        with open(mapping_file) as f:
+            raw = json.load(f)
+        # Convert string keys to int
+        mapping = {int(k): v for k, v in raw.items()}
+        print(f"✓ Loaded class mapping from {mapping_file.name}: {len(mapping)} objects")
+        return mapping
+    
+    # Try legacy format
+    legacy_file = scene_path / "EXR_RGBD" / "masks" / "object_mapping.json"
+    if legacy_file.exists():
+        with open(legacy_file) as f:
+            raw = json.load(f)
+        # Convert legacy format to new format
+        prompts = raw.get("prompts", [])
+        mapping = {0: {"class_name": "background", "instance_id": 0}}
+        for i, prompt in enumerate(prompts, start=1):
+            mapping[i] = {"class_name": prompt, "instance_id": 0}
+        print(f"✓ Loaded legacy mapping from {legacy_file.name}: {len(prompts)} prompts")
+        return mapping
+    
+    print("⚠ No class mapping file found")
+    return {}
+
+
+def get_object_label(obj_id, class_mapping):
+    """
+    Get a human-readable label for an object ID.
+    
+    Returns:
+        str like "4: book" or "object_4" if no mapping exists
+    """
+    if obj_id == 0:
+        return "background"
+    
+    if obj_id in class_mapping:
+        info = class_mapping[obj_id]
+        class_name = info.get("class_name", f"object_{obj_id}")
+        instance_id = info.get("instance_id", 0)
+        
+        # Count how many instances of this class exist
+        same_class = [k for k, v in class_mapping.items() 
+                      if v.get("class_name") == class_name and k != 0]
+        
+        if len(same_class) > 1:
+            # Multiple instances: show "4: book (inst 0)"
+            return f"{obj_id}: {class_name}"
+        else:
+            # Single instance: just show "4: book"
+            return f"{obj_id}: {class_name}"
+    
+    return f"object_{obj_id}"
+
+
 def visualize_pointclouds(scene_path, ply_files, max_points=150000, 
                          show_cameras=False, title=None, height=900,
                          color_by_semantics=False, prompts=None):
@@ -24,14 +93,12 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
         title: Custom title for the plot (default: auto-generated)
         height: Plot height in pixels (default: 900)
         color_by_semantics: Color points by object ID instead of RGB (default: False)
-        prompts: List of prompt names for legend (e.g., ["bed", "dresser", "lamp"])
-                 If None, will try to load from object_mapping.json
+        prompts: DEPRECATED - now loads from class_mapping.json automatically
     """
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
     import plotly.io as pio
     import open3d as o3d
-    import matplotlib.pyplot as plt
     
     pio.renderers.default = "notebook_connected"
     
@@ -47,14 +114,8 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
     if len(ply_files) == 0:
         raise ValueError("ply_files list is empty")
     
-    # Try to load prompts from object_mapping.json if not provided
-    if color_by_semantics and prompts is None:
-        mapping_path = scene_path / "EXR_RGBD" / "masks" / "object_mapping.json"
-        if mapping_path.exists():
-            with open(mapping_path) as f:
-                mapping = json.load(f)
-            prompts = mapping.get("prompts", [])
-            print(f"Loaded prompts from mapping: {prompts}")
+    # Load class mapping for proper labels
+    class_mapping = load_class_mapping(scene_path)
     
     print(f"\n{'='*60}")
     print(f"Loading {len(ply_files)} point cloud(s) from {scene_path.name}")
@@ -86,7 +147,14 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
             
             if ids_path.exists():
                 object_ids = np.load(ids_path)
-                print(f"  ✓ Loaded object IDs: {len(np.unique(object_ids))} unique objects")
+                unique_ids = np.unique(object_ids)
+                print(f"  ✓ Loaded object IDs: {len(unique_ids)} unique objects")
+                
+                # Show what objects we have
+                for uid in sorted(unique_ids):
+                    label = get_object_label(uid, class_mapping)
+                    count = np.sum(object_ids == uid)
+                    print(f"      {label}: {count:,} points")
             else:
                 print(f"  ⚠ object_ids.npy not found, using RGB colors")
         
@@ -96,7 +164,7 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
                 print(f"  ⚠ Warning: Could not read colors, using default gray")
                 colors = np.ones((len(points), 3)) * 0.5
         
-        print(f"  ✓ {len(points):,} points")
+        print(f"  ✓ {len(points):,} points total")
         
         point_clouds.append({
             'name': ply_file,
@@ -108,9 +176,9 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
     print()
     
     # Create semantic colormap
-    def get_semantic_colors(object_ids, num_objects=20):
+    def get_semantic_colors(object_ids, num_colors=20):
         """Generate distinct colors for each object ID."""
-        cmap = plt.cm.get_cmap('tab20', num_objects)
+        cmap = plt.cm.get_cmap('tab20', num_colors)
         
         colors = np.zeros((len(object_ids), 3))
         unique_ids = np.unique(object_ids)
@@ -206,16 +274,15 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
         cmap = plt.cm.get_cmap('tab20', 20)
         
         for obj_id in sorted(all_unique_ids):
+            # Get color
             if obj_id == 0:
                 color = 'rgb(128,128,128)'
-                name = "background"
             else:
                 c = cmap(obj_id % 20)[:3]
                 color = f'rgb({int(c[0]*255)},{int(c[1]*255)},{int(c[2]*255)})'
-                if prompts and obj_id <= len(prompts):
-                    name = f"{obj_id}: {prompts[obj_id - 1]}"
-                else:
-                    name = f"object_{obj_id}"
+            
+            # Get label from class_mapping
+            label = get_object_label(obj_id, class_mapping)
             
             # Add invisible trace for legend
             fig.add_trace(
@@ -223,7 +290,7 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
                     x=[None], y=[None], z=[None],
                     mode='markers',
                     marker=dict(size=10, color=color),
-                    name=name,
+                    name=label,
                     showlegend=True
                 ),
                 row=1, col=1
@@ -290,12 +357,7 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
         print(f"\n🎨 Object Legend:")
         print("-" * 40)
         for obj_id in sorted(all_unique_ids):
-            if obj_id == 0:
-                name = "background"
-            elif prompts and obj_id <= len(prompts):
-                name = prompts[obj_id - 1]
-            else:
-                name = f"object_{obj_id}"
+            label = get_object_label(obj_id, class_mapping)
             
             # Count points with this ID
             total_pts = sum(
@@ -303,6 +365,6 @@ def visualize_pointclouds(scene_path, ply_files, max_points=150000,
                 for data in plot_data 
                 if data['object_ids'] is not None
             )
-            print(f"  ID {obj_id:2d}: {name:20s} ({total_pts:,} pts)")
+            print(f"  {label:25s} ({total_pts:,} pts)")
     
     print(f"{'='*60}\n")

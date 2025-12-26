@@ -2,8 +2,7 @@
 Record3D data loader for Gaussian Splatting
 WITH SEMANTIC SEGMENTATION SUPPORT
 
-Uses new semantic-preserving point cloud filtering from:
-  scene.data_loaders.raw_pc_processing.process_pointcloud_with_semantics
+UPDATED: Uses masks from scene_path/object_id_masks/ and scene_path/class_mapping.json
 """
 
 import json
@@ -400,7 +399,7 @@ def save_processed_pointcloud_with_semantics(scene_path, points, colors, object_
 
 
 # =============================================================================
-# Reconstruction
+# Reconstruction - UPDATED FOR NEW MASK LOCATION
 # =============================================================================
 
 def reconstruct_from_rgbd_with_semantics(
@@ -408,35 +407,53 @@ def reconstruct_from_rgbd_with_semantics(
     frame_indices,
     subsample=4,
     voxel_size=0.01,
-    min_views=5,
+    min_views=2,
     # semantic-preserving parameters
     prefer_nonzero=True,
     min_nonzero_votes=2,
-    min_nonzero_ratio=0.20,  # good default for small objects
+    min_nonzero_ratio=0.10,  # good default for small objects
     background_id=0,
 ):
     """
     Reconstruct point cloud from RGBD frames WITH semantic labels,
     then filter using the new semantic-preserving pc_processing.
+    
+    UPDATED: Expects masks in scene_path/object_id_masks/
+    And class mapping in scene_path/class_mapping.json
     """
     from tqdm import tqdm
 
     meta = load_record3d_metadata(scene_path)
     scene_path = Path(scene_path)
 
-    masks_dir = scene_path / "EXR_RGBD" / "masks"
+    # NEW: Load from object_id_masks directory (sibling of EXR_RGBD)
+    masks_dir = scene_path / "object_id_masks"
     has_masks = masks_dir.exists()
 
     if has_masks:
-        print(f"Found masks directory: {masks_dir}")
-        mapping_path = masks_dir / "object_mapping.json"
+        print(f"✓ Found masks directory: {masks_dir}")
+        
+        # NEW: Load class_mapping.json from scene root
+        mapping_path = scene_path / "class_mapping.json"
         if mapping_path.exists():
             with open(mapping_path) as f:
-                mapping = json.load(f)
-            print(f"  Prompts: {mapping.get('prompts', 'N/A')}")
-            print(f"  Objects: {mapping.get('num_objects', 'N/A')}")
+                class_mapping = json.load(f)
+            
+            # Convert string keys to int
+            class_mapping = {int(k): v for k, v in class_mapping.items()}
+            
+            # Count unique objects (excluding background)
+            num_objects = len([k for k in class_mapping.keys() if k != 0])
+            
+            # Get unique class names
+            class_names = set(info['class_name'] for obj_id, info in class_mapping.items() if obj_id != 0)
+            
+            print(f"  Loaded class mapping with {num_objects} objects across {len(class_names)} classes")
+            print(f"  Classes: {sorted(class_names)}")
+        else:
+            print(f"  Warning: class_mapping.json not found at {mapping_path}")
     else:
-        print("No masks directory found - using object_id=0 for all points")
+        print("⚠️  No masks directory found - using object_id=0 for all points")
 
     points_by_frame, colors_by_frame, object_ids_by_frame = [], [], []
 
@@ -452,7 +469,19 @@ def reconstruct_from_rgbd_with_semantics(
             rgb_path = scene_path / "EXR_RGBD" / "rgb" / f"{file_id}.jpg"
 
         depth_path = scene_path / "EXR_RGBD" / "depth" / f"{file_id}.exr"
-        mask_path = (masks_dir / f"{file_id}.png") if has_masks else None
+        
+        # NEW: Look for masks in object_id_masks with frame_XXXX.png naming
+        mask_path = None
+        if has_masks:
+            # Try frame_XXXX.png format first (from create_object_id_masks)
+            candidate = masks_dir / f"frame_{idx:04d}.png"
+            if candidate.exists():
+                mask_path = candidate
+            else:
+                # Fallback to file_id.png
+                candidate = masks_dir / f"{file_id}.png"
+                if candidate.exists():
+                    mask_path = candidate
 
         if not rgb_path.exists():
             continue
@@ -505,7 +534,7 @@ def reconstruct_from_rgbd_with_semantics(
 
 
 # =============================================================================
-# Scene class
+# Scene class - UPDATED FOR NEW MASK LOCATION
 # =============================================================================
 
 class Record3DScene:
@@ -553,12 +582,13 @@ class Record3DScene:
         print(f"  Training: {len(train_frames)} frames")
         print(f"  Testing: {len(test_frames)} frames")
 
-        masks_dir = self.scene_path / "EXR_RGBD" / "masks"
+        # NEW: Look for masks in scene_path/object_id_masks
+        masks_dir = self.scene_path / "object_id_masks"
         self.has_masks = masks_dir.exists() and use_semantics
 
         if use_semantics and not masks_dir.exists():
             print(f"\n⚠️  Warning: use_semantics=True but no masks found at {masks_dir}")
-            print("   Run generate_masks first, or set use_semantics=False")
+            print("   Run process_and_save_masks() first, or set use_semantics=False")
             self.has_masks = False
 
         # cameras
@@ -568,7 +598,7 @@ class Record3DScene:
         print("\nLoading point cloud...")
 
         if pointcloud_path is not None:
-            raise NotImplementedError("Custom pointcloud_path path not wired in this rewrite (easy to add).")
+            raise NotImplementedError("Custom pointcloud_path not implemented in this version.")
 
         if use_semantics and self.has_masks:
             semantic_exists = (self.scene_path / "processed_semantic.ply").exists() and \
@@ -582,8 +612,6 @@ class Record3DScene:
                     self.scene_path,
                     frame_indices=train_frames,
                     subsample=subsample,
-                    voxel_size=0.01,
-                    min_views=5,
                     prefer_nonzero=prefer_nonzero,
                     min_nonzero_votes=min_nonzero_votes,
                     min_nonzero_ratio=min_nonzero_ratio,
@@ -591,7 +619,7 @@ class Record3DScene:
                 )
                 save_processed_pointcloud_with_semantics(self.scene_path, points, colors, object_ids)
         else:
-            raise NotImplementedError("Non-semantic path omitted in this rewrite (you can keep your old legacy path).")
+            raise NotImplementedError("Non-semantic path omitted - you can add your legacy code here.")
 
         self.points = points
         self.colors = colors
@@ -602,7 +630,8 @@ class Record3DScene:
         from tqdm import tqdm
 
         cameras = []
-        masks_dir = self.scene_path / "EXR_RGBD" / "masks"
+        # NEW: Look for masks in scene_path/object_id_masks
+        masks_dir = self.scene_path / "object_id_masks"
 
         print(f"\nCreating {len(frame_indices)} cameras...")
 
@@ -617,11 +646,18 @@ class Record3DScene:
 
             depth_path = self.scene_path / "EXR_RGBD" / "depth" / f"{file_id}.exr"
 
+            # NEW: Look for masks with frame_XXXX.png naming
             mask_path = None
             if self.has_masks:
-                candidate = masks_dir / f"{file_id}.png"
+                # Try frame_XXXX.png format first
+                candidate = masks_dir / f"frame_{idx:04d}.png"
                 if candidate.exists():
                     mask_path = candidate
+                else:
+                    # Fallback to file_id.png
+                    candidate = masks_dir / f"{file_id}.png"
+                    if candidate.exists():
+                        mask_path = candidate
 
             if not rgb_path.exists():
                 print(f"  Warning: RGB not found for frame {idx}, skipping")
