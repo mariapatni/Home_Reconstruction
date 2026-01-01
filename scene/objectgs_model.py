@@ -1,11 +1,15 @@
 """
 ObjectGS: Anchor-based Gaussian Splatting with Object Awareness
 
-COMPLETE IMPLEMENTATION with:
+INSTANCE SEGMENTATION VERSION with:
+- Instance-aware voxelization (no majority voting that merges instances)
 - View-dependent attribute generation (direction + distance)
 - Dynamic anchor growing and pruning
-- Full semantic support with object-aware rendering
+- Full instance segmentation support with one-hot encoding
 - Anchor color baseline for proper initialization
+
+Based on the ObjectGS paper: "ObjectGS: Object-aware Scene Reconstruction 
+and Scene Understanding via Gaussian Splatting"
 """
 
 import torch
@@ -20,7 +24,7 @@ class ViewDependentAttributeMLP(nn.Module):
     """
     MLP to generate Gaussian attributes from anchor features.
     
-    Now includes view-dependence following the paper:
+    Includes view-dependence following the paper:
     {c_0, ..., c_{k-1}} = MLP(f, δ, d)
     
     Where:
@@ -122,29 +126,36 @@ class ViewDependentAttributeMLP(nn.Module):
 
 class ObjectGSModel(nn.Module):
     """
-    ObjectGS Model - Complete Implementation
+    ObjectGS Model - Instance Segmentation Version
     
     Features:
-    - Per-Gaussian object IDs from SAM3 segmentation
+    - Per-Gaussian instance IDs from SAM3 segmentation
+    - Instance-aware voxelization (overlapping instances get separate anchors)
     - View-dependent color generation with anchor color baseline
     - Dynamic anchor growing and pruning
+    - One-hot semantic encoding for classification-based loss
     - Object-aware rendering and editing
+    
+    Key difference from semantic segmentation version:
+    - Voxelization uses (voxel_x, voxel_y, voxel_z, instance_id) keys
+    - This ensures different instances in the same spatial location get separate anchors
+    - No majority voting that could merge instance boundaries
     """
     
     def __init__(self, point_cloud: np.ndarray, colors: np.ndarray, 
                  object_ids: Optional[np.ndarray] = None,
-                 voxel_size: float = 0.02, k: int = 10, feature_dim: int = 32,
+                 voxel_size: float = 0.01, k: int = 10, feature_dim: int = 32,
                  object_names: Optional[List[str]] = None, 
                  logger: Optional[logging.Logger] = None):
         """
         Args:
             point_cloud: (N, 3) numpy array of points
             colors: (N, 3) numpy array of RGB colors [0, 1]
-            object_ids: (N,) numpy array of integer object IDs (0=background)
-            voxel_size: Voxel size for anchor creation
+            object_ids: (N,) numpy array of integer instance IDs (0=background)
+            voxel_size: Voxel size for anchor creation (default 1cm)
             k: Number of Gaussians per anchor
             feature_dim: Anchor feature dimension
-            object_names: List of object names
+            object_names: List of object names (from class_mapping.json)
             logger: Optional logger
         """
         super().__init__()
@@ -160,6 +171,7 @@ class ObjectGSModel(nn.Module):
             if self.logger:
                 self.logger.warning("No object_ids provided, using all zeros (background)")
         
+        # num_objects is the total number of instance classes (including background at 0)
         self.num_objects = int(object_ids.max()) + 1
         self.object_names = object_names or [f"object_{i}" for i in range(self.num_objects)]
         if len(self.object_names) > 0:
@@ -168,8 +180,8 @@ class ObjectGSModel(nn.Module):
         if self.logger:
             self._log_init_info(point_cloud, object_ids)
         
-        # Voxelize with semantic voting
-        anchor_positions, anchor_colors, anchor_object_ids = self._voxelize(
+        # Instance-aware voxelization (KEY CHANGE from semantic version)
+        anchor_positions, anchor_colors, anchor_object_ids = self._voxelize_instance_aware(
             point_cloud, colors, object_ids
         )
         
@@ -194,7 +206,7 @@ class ObjectGSModel(nn.Module):
             torch.tensor(anchor_colors, dtype=torch.float32)
         )
         
-        # Anchor object IDs - buffer
+        # Anchor object IDs - buffer (instance IDs, not learnable)
         self.register_buffer(
             'anchor_object_ids',
             torch.tensor(anchor_object_ids, dtype=torch.long)
@@ -235,6 +247,7 @@ class ObjectGSModel(nn.Module):
         self._num_gaussians = num_anchors * k
         
         if self.logger:
+            self.logger.info(f"One-hot semantic dimension: {self.num_objects}")
             self.logger.info("=" * 70)
     
     @property
@@ -247,25 +260,34 @@ class ObjectGSModel(nn.Module):
     
     def _log_init_info(self, point_cloud, object_ids):
         self.logger.info("=" * 70)
-        self.logger.info("INITIALIZING ObjectGSModel")
+        self.logger.info("INITIALIZING ObjectGSModel (Instance Segmentation)")
         self.logger.info("=" * 70)
         self.logger.info(f"Input points: {len(point_cloud):,}")
-        self.logger.info(f"Voxel size: {self.voxel_size}")
+        self.logger.info(f"Voxel size: {self.voxel_size}m ({self.voxel_size*100:.1f}cm)")
         self.logger.info(f"k (Gaussians/anchor): {self.k}")
         self.logger.info(f"Feature dim: {self.feature_dim}")
-        self.logger.info(f"Number of objects: {self.num_objects}")
-        for i, name in enumerate(self.object_names[:10]):
-            count = np.sum(object_ids == i)
-            self.logger.info(f"  ID {i}: {name} ({count:,} points)")
-        if self.num_objects > 10:
-            self.logger.info(f"  ... and {self.num_objects - 10} more")
+        self.logger.info(f"Number of instances: {int(object_ids.max()) + 1}")
+        
+        unique_ids, counts = np.unique(object_ids, return_counts=True)
+        self.logger.info("Instance distribution (top 10):")
+        sorted_idx = np.argsort(-counts)[:10]
+        for idx in sorted_idx:
+            obj_id = unique_ids[idx]
+            count = counts[idx]
+            name = self.object_names[obj_id] if obj_id < len(self.object_names) else f"instance_{obj_id}"
+            self.logger.info(f"  ID {obj_id}: {name} ({count:,} points)")
+        if len(unique_ids) > 10:
+            self.logger.info(f"  ... and {len(unique_ids) - 10} more instances")
     
     def _log_anchor_info(self, anchor_object_ids, num_anchors):
         self.logger.info(f"Created {num_anchors:,} anchors → {num_anchors * self.k:,} Gaussians")
         unique, counts = np.unique(anchor_object_ids, return_counts=True)
-        self.logger.info("Anchors per object:")
-        for obj_id, count in zip(unique[:10], counts[:10]):
-            name = self.object_names[obj_id] if obj_id < len(self.object_names) else f"object_{obj_id}"
+        self.logger.info("Anchors per instance (top 10):")
+        sorted_idx = np.argsort(-counts)[:10]
+        for idx in sorted_idx:
+            obj_id = unique[idx]
+            count = counts[idx]
+            name = self.object_names[obj_id] if obj_id < len(self.object_names) else f"instance_{obj_id}"
             self.logger.info(f"  {name}: {count:,} anchors ({count * self.k:,} Gaussians)")
     
     def _init_features(self, anchor_colors, num_anchors):
@@ -275,38 +297,65 @@ class ObjectGSModel(nn.Module):
         features[:, :3] = torch.tensor(anchor_colors, dtype=torch.float32)
         return features
     
-    def _voxelize(self, points: np.ndarray, colors: np.ndarray, 
-                  object_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Voxelize point cloud with semantic majority voting"""
+    def _voxelize_instance_aware(self, points: np.ndarray, colors: np.ndarray, 
+                                  object_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Instance-aware voxelization.
+        
+        KEY DIFFERENCE from semantic version:
+        - Uses (voxel_x, voxel_y, voxel_z, instance_id) as keys
+        - Different instances in the same spatial voxel get SEPARATE anchors
+        - No majority voting that could merge instance boundaries
+        
+        This is critical for instance segmentation where you need to preserve
+        the identity of each instance even when objects are touching or overlapping.
+        
+        Args:
+            points: (N, 3) point positions
+            colors: (N, 3) RGB colors
+            object_ids: (N,) instance IDs
+            
+        Returns:
+            anchor_positions: (M, 3) anchor positions
+            anchor_colors: (M, 3) anchor colors
+            anchor_object_ids: (M,) anchor instance IDs
+        """
         voxel_indices = np.floor(points / self.voxel_size).astype(np.int32)
         
+        # KEY CHANGE: Use (voxel, instance_id) as key
         voxel_dict = {}
         for i, vidx in enumerate(voxel_indices):
-            key = tuple(vidx)
+            # Include instance_id in the key - this prevents merging different instances
+            key = (tuple(vidx), int(object_ids[i]))
             if key not in voxel_dict:
-                voxel_dict[key] = {'colors': [], 'object_ids': []}
+                voxel_dict[key] = {'colors': [], 'points': []}
             voxel_dict[key]['colors'].append(colors[i])
-            voxel_dict[key]['object_ids'].append(object_ids[i])
+            voxel_dict[key]['points'].append(points[i])
         
         anchor_positions = []
         anchor_colors = []
         anchor_object_ids = []
         
-        for vidx, data in voxel_dict.items():
-            pos = (np.array(vidx) + 0.5) * self.voxel_size
+        for (vidx, instance_id), data in voxel_dict.items():
+            # Use centroid of actual points (more accurate than voxel center)
+            pos = np.mean(data['points'], axis=0)
             avg_color = np.mean(data['colors'], axis=0)
-            
-            # Majority vote for object ID
-            ids = np.array(data['object_ids'])
-            obj_id = int(np.bincount(ids).argmax()) if len(ids) > 0 else 0
             
             anchor_positions.append(pos)
             anchor_colors.append(avg_color)
-            anchor_object_ids.append(obj_id)
+            anchor_object_ids.append(instance_id)
+        
+        if self.logger:
+            n_spatial_voxels = len(set(k[0] for k in voxel_dict.keys()))
+            n_instance_anchors = len(voxel_dict)
+            overlap_anchors = n_instance_anchors - n_spatial_voxels
+            if overlap_anchors > 0:
+                self.logger.info(f"Instance-aware voxelization: {n_spatial_voxels:,} spatial voxels → {n_instance_anchors:,} anchors")
+                self.logger.info(f"  ({overlap_anchors:,} anchors from overlapping instances)")
         
         return (np.array(anchor_positions), 
                 np.array(anchor_colors), 
-                np.array(anchor_object_ids))
+                np.array(anchor_object_ids, dtype=np.int32))
     
     def _init_mlp(self):
         """Initialize MLP weights for stable training"""
@@ -368,7 +417,14 @@ class ObjectGSModel(nn.Module):
             object_mask: Optional list of object IDs to include
         
         Returns:
-            Dictionary of Gaussian parameters
+            Dictionary of Gaussian parameters including:
+            - pos: [N_gaussians, 3] positions
+            - opacity_raw: [N_gaussians, 1] raw opacities (apply sigmoid)
+            - scale_raw: [N_gaussians, 3] raw scales (apply exp)
+            - rotation: [N_gaussians, 4] quaternions
+            - color: [N_gaussians, 3] RGB colors
+            - object_ids: [N_gaussians] integer instance IDs
+            - semantics: [N_gaussians, num_objects] one-hot encoding
         """
         # Compute view info if camera provided
         if camera_center is not None:
@@ -409,7 +465,8 @@ class ObjectGSModel(nn.Module):
         # Expand object IDs to Gaussians
         gaussian_object_ids = self.anchor_object_ids.unsqueeze(1).expand(-1, self.k).reshape(-1)
         
-        # One-hot semantics
+        # One-hot semantics for classification-based rendering
+        # This is the key to the paper's approach - semantics are discrete, not continuous
         semantics = F.one_hot(gaussian_object_ids, num_classes=self.num_objects).float()
         
         result = {
@@ -505,6 +562,7 @@ class ObjectGSModel(nn.Module):
         Perform anchor densification (growing) and pruning.
         
         This is the key dynamic adaptation mechanism from Scaffold-GS.
+        Grown anchors inherit their parent's instance ID.
         
         Args:
             grad_threshold: Gradient threshold for densification
@@ -559,6 +617,9 @@ class ObjectGSModel(nn.Module):
     def _apply_densification(self, prune_mask: torch.Tensor, grow_mask: torch.Tensor):
         """
         Apply pruning and growing to anchor tensors.
+        
+        IMPORTANT: Grown anchors inherit their parent's instance ID.
+        This maintains instance consistency during densification.
         """
         device = self.anchor_positions.device
         
@@ -603,6 +664,7 @@ class ObjectGSModel(nn.Module):
                 # Clone with small perturbation
                 grown_positions = new_positions[grow_in_kept] + torch.randn(len(grow_in_kept), 3, device=device) * self.voxel_size * 0.1
                 grown_colors = new_colors[grow_in_kept]
+                # IMPORTANT: Grown anchors inherit parent's instance ID
                 grown_object_ids = new_object_ids[grow_in_kept]
                 grown_features = new_features[grow_in_kept] + torch.randn(len(grow_in_kept), self.feature_dim, device=device) * 0.01
                 grown_scalings = new_scalings[grow_in_kept]
@@ -765,3 +827,27 @@ class ObjectGSModel(nn.Module):
         
         if self.logger:
             self.logger.info(f"Exported {name}: {len(positions):,} Gaussians to {output_path}")
+    
+    def export_all_objects_ply(self, output_dir: str, min_opacity: float = 0.1):
+        """
+        Export all objects as separate PLY files.
+        
+        Args:
+            output_dir: Directory to save PLY files
+            min_opacity: Minimum opacity threshold for export
+        """
+        from pathlib import Path
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        for obj_id in range(self.num_objects):
+            mask = self.anchor_object_ids == obj_id
+            if mask.sum() == 0:
+                continue
+            
+            name = self.object_names[obj_id] if obj_id < len(self.object_names) else f"object_{obj_id}"
+            # Sanitize filename
+            safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+            output_path = output_dir / f"{obj_id:03d}_{safe_name}.ply"
+            
+            self.export_object_ply(obj_id, str(output_path), min_opacity)

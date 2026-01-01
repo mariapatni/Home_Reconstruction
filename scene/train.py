@@ -1,8 +1,10 @@
 """
-Training script for ObjectGS - FAST VERSION
+Training script for ObjectGS - Instance Segmentation Version
 
 Features:
-- Uses ObjectGSModelFast with batched parameters (no Python loops)
+- Uses ObjectGSModel with instance-aware voxelization
+- Semantic rendering via gsplat (RGB + one-hot concatenated)
+- Cross-entropy semantic loss per the ObjectGS paper
 - Organized output structure: outputs/{scene}/training_run_{n}/
 - PST timestamps in logs
 - gsplat CUDA rasterizer
@@ -20,6 +22,7 @@ import logging
 import os
 from datetime import datetime
 import pytz
+import numpy as np
 
 
 # =============================================================================
@@ -152,7 +155,12 @@ def setup_training_logger(run_manager: RunManager) -> logging.Logger:
 
 class GaussianTrainer:
     """
-    Fast trainer for ObjectGS using batched model and gsplat CUDA rasterizer.
+    Trainer for ObjectGS with instance segmentation support.
+    
+    Key features:
+    - Renders RGB + one-hot semantics together via gsplat
+    - Computes cross-entropy semantic loss against GT masks
+    - Supports variable number of instances per scene
     """
     
     def __init__(self, model, scene, scene_name: str, config=None, 
@@ -167,7 +175,7 @@ class GaussianTrainer:
         self.model = model
         self.scene = scene
         
-        # Default config
+        # Default config with semantic loss
         self.config = {
             'lr': 0.001,
             'lr_position': 0.00016,
@@ -185,6 +193,7 @@ class GaussianTrainer:
             'lambda_ssim': 0.2,
             'lambda_vol': 1e-05,
             'lambda_scale': 10.0,
+            'lambda_semantic': 0.1,  # Semantic loss weight (paper uses 0.01-0.1)
             'scale_threshold': 0.03,
             'min_opacity': 0.001,
             'max_opacity': 0.999,
@@ -209,6 +218,10 @@ class GaussianTrainer:
             self.logger.info(f"CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
         
         self.model.to(self.device)
+        
+        # Log semantic info
+        self.logger.info(f"Number of instances: {self.model.num_objects}")
+        self.logger.info(f"One-hot semantic dimension: {self.model.num_objects}")
         
         # Setup cameras
         self.train_cameras = scene.getTrainCameras()
@@ -242,8 +255,11 @@ class GaussianTrainer:
             self.logger.info(f"  {pg['name']}: lr={pg['lr']}")
     
     def _prepare_cameras(self):
-        """Cache camera data on GPU"""
+        """Cache camera data on GPU, including GT masks for semantic supervision"""
         self.logger.info("Caching camera data on GPU...")
+        
+        cameras_with_masks = 0
+        cameras_without_masks = 0
         
         for cam in self.train_cameras + self.test_cameras:
             if not hasattr(cam, '_viewmat_gpu'):
@@ -256,13 +272,33 @@ class GaussianTrainer:
                 ], device=self.device, dtype=torch.float32).contiguous()
             if not hasattr(cam, '_gt_image_gpu'):
                 cam._gt_image_gpu = cam.original_image.to(self.device).contiguous()
+            
+            # Cache GT semantic masks for semantic loss
+            if not hasattr(cam, '_gt_mask_gpu'):
+                if hasattr(cam, 'object_mask') and cam.object_mask is not None:
+                    cam._gt_mask_gpu = cam.object_mask.to(self.device).long().contiguous()
+                else:
+                    cam._gt_mask_gpu = None
+            
+            # Count masks (separate from caching logic)
+            if cam._gt_mask_gpu is not None:
+                cameras_with_masks += 1
+            else:
+                cameras_without_masks += 1
         
         sample_gt = self.train_cameras[0]._gt_image_gpu
         self.logger.info(f"GT images: shape={list(sample_gt.shape)}, "
                         f"range=[{sample_gt.min():.3f}, {sample_gt.max():.3f}]")
-    
+        self.logger.info(f"Cameras with semantic masks: {cameras_with_masks}")
+        if cameras_without_masks > 0:
+            self.logger.warning(f"Cameras WITHOUT semantic masks: {cameras_without_masks} (semantic loss will be skipped)")
+        
     def render(self, camera, params=None):
-        """Render using gsplat CUDA rasterizer"""
+        """
+        Render using gsplat CUDA rasterizer.
+        
+        Returns RGB image only (use render_with_semantics for full output).
+        """
         if params is None:
             params = self.model.get_parameters_as_tensors()
         
@@ -290,27 +326,129 @@ class GaussianTrainer:
         
         return renders[0].permute(2, 0, 1), alphas[0], info
     
+    def render_with_semantics(self, camera, params=None):
+        """
+        Render RGB and semantics together via gsplat.
+        
+        This concatenates RGB (3 channels) with one-hot semantics (num_objects channels)
+        and renders them all in a single pass. gsplat handles arbitrary feature dimensions.
+        
+        The alpha blending produces:
+        - RGB: blended colors
+        - Semantics: probability distribution over instances (per the ObjectGS paper)
+        
+        Returns:
+            rgb: [3, H, W] rendered RGB image
+            semantics: [num_objects, H, W] rendered semantic probabilities
+            alpha: [H, W] alpha channel
+            info: gsplat info dict
+        """
+        if params is None:
+            params = self.model.get_parameters_as_tensors()
+        
+        means = params['pos']
+        opacities = torch.sigmoid(params['opacity_raw']).squeeze(-1)
+        scales = torch.exp(params['scale_raw'])
+        quats = params['rotation']
+        colors = params['color']  # [N, 3]
+        semantics = params['semantics']  # [N, num_objects] one-hot
+        
+        # Concatenate RGB + semantics for joint rendering
+        # gsplat will alpha-blend all channels together
+        features = torch.cat([colors, semantics], dim=-1)  # [N, 3 + num_objects]
+        
+        viewmat = camera._viewmat_gpu
+        K = camera._K_gpu
+        
+        renders, alphas, info = gsplat.rasterization(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=features,  # [N, 3 + num_objects]
+            viewmats=viewmat.unsqueeze(0),
+            Ks=K[None],
+            width=camera.image_width,
+            height=camera.image_height,
+            packed=False,
+        )
+        
+        # renders shape: [1, H, W, 3 + num_objects]
+        output = renders[0]  # [H, W, 3 + num_objects]
+        
+        # Split back into RGB and semantics
+        rgb = output[..., :3].permute(2, 0, 1)  # [3, H, W]
+        semantics_rendered = output[..., 3:].permute(2, 0, 1)  # [num_objects, H, W]
+        
+        return rgb, semantics_rendered, alphas[0], info
+    
+    def compute_semantic_loss(self, rendered_semantics, gt_mask):
+        """
+        Compute cross-entropy semantic loss per the ObjectGS paper (Equation 7).
+        
+        The rendered semantics are probability distributions over instances
+        (result of alpha-blending one-hot vectors). We use cross-entropy to
+        push these probabilities toward the ground truth instance labels.
+        
+        Args:
+            rendered_semantics: [num_objects, H, W] probability distribution per pixel
+            gt_mask: [H, W] integer instance IDs (ground truth)
+        
+        Returns:
+            semantic_loss: scalar tensor
+        """
+        if gt_mask is None:
+            return torch.tensor(0.0, device=rendered_semantics.device)
+        
+        # Cross-entropy expects [N, C, H, W] input and [N, H, W] target
+        # rendered_semantics is [C, H, W], gt_mask is [H, W]
+        pred = rendered_semantics.unsqueeze(0)  # [1, num_objects, H, W]
+        target = gt_mask.unsqueeze(0)  # [1, H, W]
+        
+        # Clamp target to valid range (in case of any label issues)
+        num_classes = rendered_semantics.shape[0]
+        target = target.clamp(0, num_classes - 1)
+        
+        # Cross-entropy loss
+        # Note: rendered_semantics are already "probabilities" from alpha blending,
+        # but cross_entropy expects logits. We can either:
+        # 1. Add small epsilon and take log (treating as probabilities)
+        # 2. Use the raw values as logits (works if they're in reasonable range)
+        # 
+        # The paper uses classification loss on the blended one-hot vectors.
+        # Since alpha-blended one-hots sum to ~1 and are non-negative, we treat
+        # them as unnormalized logits. Cross-entropy will apply softmax internally.
+        
+        loss = F.cross_entropy(pred, target, reduction='mean')
+        
+        return loss
+    
     def train_step(self):
-        """Single training step"""
+        """Single training step with RGB and semantic losses"""
         cam_idx = torch.randint(0, len(self.train_cameras), (1,)).item()
         camera = self.train_cameras[cam_idx]
         gt_image = camera._gt_image_gpu
+        gt_mask = camera._gt_mask_gpu  # May be None
         
         params = self.model.get_parameters_as_tensors()
-        rendered, alpha, info = self.render(camera, params)
         
-        # Losses
-        l1_loss = F.l1_loss(rendered, gt_image)
+        # Render RGB + semantics together
+        rendered_rgb, rendered_semantics, alpha, info = self.render_with_semantics(camera, params)
+        
+        # ==================== RGB Losses ====================
+        l1_loss = F.l1_loss(rendered_rgb, gt_image)
         
         ssim_val = ssim_func(
-            rendered.unsqueeze(0), gt_image.unsqueeze(0),
+            rendered_rgb.unsqueeze(0), gt_image.unsqueeze(0),
             data_range=1.0, size_average=True
         )
         ssim_loss = 1.0 - ssim_val
         
-        # Volume regularization
+        # ==================== Regularization Losses ====================
         opacities = torch.sigmoid(params['opacity_raw']).squeeze(-1)
         scales = torch.exp(params['scale_raw'])
+        
+        # Volume regularization
         volumes = scales.prod(dim=-1) * opacities
         vol_loss = volumes.mean()
         
@@ -320,11 +458,18 @@ class GaussianTrainer:
         scale_excess = torch.relu(scales - scale_threshold)
         scale_reg = (scale_excess ** 2).mean() + (scale_excess ** 2).max()
         
-        # Total loss
+        # ==================== Semantic Loss ====================
+        if gt_mask is not None:
+            semantic_loss = self.compute_semantic_loss(rendered_semantics, gt_mask)
+        else:
+            semantic_loss = torch.tensor(0.0, device=self.device)
+        
+        # ==================== Total Loss ====================
         loss = (l1_loss + 
                 self.config['lambda_ssim'] * ssim_loss + 
                 self.config['lambda_vol'] * vol_loss + 
-                lambda_scale * scale_reg)
+                lambda_scale * scale_reg +
+                self.config['lambda_semantic'] * semantic_loss)
         
         # Backward
         self.optimizer.zero_grad()
@@ -339,8 +484,9 @@ class GaussianTrainer:
             'ssim_val': ssim_val.item(),
             'vol': vol_loss.item(),
             'scale_reg': scale_reg.item(),
-            'render_mean': rendered.mean().item(),
-            'render_std': rendered.std().item(),
+            'semantic': semantic_loss.item(),
+            'render_mean': rendered_rgb.mean().item(),
+            'render_std': rendered_rgb.std().item(),
         }
         
         self.losses_history.append(losses)
@@ -350,6 +496,7 @@ class GaussianTrainer:
         """Main training loop"""
         self.logger.info("=" * 70)
         self.logger.info(f"STARTING TRAINING: {self.config['num_iterations']} iterations")
+        self.logger.info(f"Semantic loss weight: {self.config['lambda_semantic']}")
         self.logger.info("=" * 70)
         
         # Warm-up timing
@@ -385,7 +532,7 @@ class GaussianTrainer:
                 self.logger.error(traceback.format_exc())
                 continue
             
-            pbar.set_description(f"L1:{losses['l1']:.4f} SSIM:{losses['ssim_val']:.3f}")
+            pbar.set_description(f"L1:{losses['l1']:.4f} SSIM:{losses['ssim_val']:.3f} Sem:{losses['semantic']:.4f}")
             
             # LR step
             if i % 100 == 0:
@@ -395,12 +542,12 @@ class GaussianTrainer:
             if i % self.config['log_interval'] == 0:
                 self.logger.info(
                     f"[{i:5d}] Loss={losses['loss']:.4f} L1={losses['l1']:.4f} "
-                    f"SSIM={losses['ssim_val']:.3f} ScReg={losses['scale_reg']:.4f}"
+                    f"SSIM={losses['ssim_val']:.3f} Sem={losses['semantic']:.4f}"
                 )
             
             # Test evaluation with 0.5 scale
             if i % self.config['test_interval'] == 0:
-                self.evaluate(i, scale=0.5)  # <-- Add scale parameter
+                self.evaluate(i, scale=0.5)
             
             # Checkpoint
             if i % self.config['save_interval'] == 0:
@@ -428,7 +575,7 @@ class GaussianTrainer:
     
     def evaluate(self, iteration, final=False, scale=0.5):
         """
-        Evaluate on test set
+        Evaluate on test set (RGB and semantic accuracy)
         
         Args:
             iteration: Current iteration number
@@ -439,18 +586,27 @@ class GaussianTrainer:
         
         self.model.eval()
         test_losses = []
+        semantic_accuracies = []
         
         with torch.no_grad():
             for cam_idx, camera in enumerate(self.test_cameras[:5]):
                 gt = camera._gt_image_gpu
-                rendered, _, _ = self.render(camera)
+                gt_mask = camera._gt_mask_gpu
                 
-                l1 = F.l1_loss(rendered, gt).item()
+                rendered_rgb, rendered_semantics, _, _ = self.render_with_semantics(camera)
+                
+                l1 = F.l1_loss(rendered_rgb, gt).item()
                 test_losses.append(l1)
+                
+                # Compute semantic accuracy if mask available
+                if gt_mask is not None:
+                    pred_ids = rendered_semantics.argmax(dim=0)  # [H, W]
+                    accuracy = (pred_ids == gt_mask).float().mean().item()
+                    semantic_accuracies.append(accuracy)
                 
                 # Save first comparison
                 if cam_idx == 0:
-                    comparison = torch.cat([rendered, gt], dim=2)
+                    comparison = torch.cat([rendered_rgb, gt], dim=2)
                     
                     # Apply scaling
                     if scale != 1.0:
@@ -467,16 +623,58 @@ class GaussianTrainer:
                         save_path = self.run_manager.progress_renders_dir / f'iter_{iteration:06d}.png'
                     save_image(comparison, save_path)
                     
-                    self.logger.info(f"  Render: mean={rendered.mean():.3f}, "
-                                   f"std={rendered.std():.3f}, "
-                                   f"range=[{rendered.min():.3f}, {rendered.max():.3f}]")
+                    # Also save semantic visualization if mask available
+                    if gt_mask is not None and final:
+                        self._save_semantic_visualization(
+                            rendered_semantics, gt_mask, 
+                            self.run_manager.final_outputs_dir / 'final_semantics.png',
+                            scale
+                        )
+                    
+                    self.logger.info(f"  Render: mean={rendered_rgb.mean():.3f}, "
+                                   f"std={rendered_rgb.std():.3f}, "
+                                   f"range=[{rendered_rgb.min():.3f}, {rendered_rgb.max():.3f}]")
                     self.logger.info(f"  GT:     mean={gt.mean():.3f}, std={gt.std():.3f}")
         
         avg_loss = sum(test_losses) / len(test_losses)
         self.logger.info(f"  Test L1: {avg_loss:.4f}")
         
+        if semantic_accuracies:
+            avg_accuracy = sum(semantic_accuracies) / len(semantic_accuracies)
+            self.logger.info(f"  Semantic Accuracy: {avg_accuracy:.4f} ({avg_accuracy*100:.1f}%)")
+        
         self.model.train()
         return avg_loss
+    
+    def _save_semantic_visualization(self, rendered_semantics, gt_mask, save_path, scale=1.0):
+        """Save a visualization comparing predicted vs GT semantics"""
+        # Get predicted instance IDs
+        pred_ids = rendered_semantics.argmax(dim=0)  # [H, W]
+        
+        # Create color maps (random but consistent colors per ID)
+        num_objects = self.model.num_objects
+        np.random.seed(42)
+        colors = np.random.rand(num_objects, 3)
+        colors[0] = [0.2, 0.2, 0.2]  # Background is dark gray
+        colors = torch.tensor(colors, dtype=torch.float32, device=pred_ids.device)
+        
+        # Map IDs to colors
+        pred_vis = colors[pred_ids]  # [H, W, 3]
+        gt_vis = colors[gt_mask]  # [H, W, 3]
+        
+        # Stack side by side: pred | gt
+        comparison = torch.cat([pred_vis, gt_vis], dim=1)  # [H, 2*W, 3]
+        comparison = comparison.permute(2, 0, 1)  # [3, H, 2*W]
+        
+        if scale != 1.0:
+            comparison = F.interpolate(
+                comparison.unsqueeze(0),
+                scale_factor=scale,
+                mode='nearest'
+            )[0]
+        
+        save_image(comparison, save_path)
+        self.logger.info(f"  Saved semantic visualization: {save_path}")
     
     def save_checkpoint(self, iteration, final=False):
         """Save model checkpoint"""
@@ -493,6 +691,7 @@ class GaussianTrainer:
             'config': self.config,
             'scene_name': self.run_manager.scene_name,
             'run_name': self.run_manager.run_name,
+            'num_objects': self.model.num_objects,
         }, path)
         
         self.logger.info(f"Saved checkpoint: {path}")
@@ -504,6 +703,7 @@ class GaussianTrainer:
             'config': self.config,
             'scene_name': self.run_manager.scene_name,
             'run_name': self.run_manager.run_name,
+            'num_objects': self.model.num_objects,
         }
         
         path = self.run_manager.final_outputs_dir / 'training_history.json'
@@ -512,8 +712,6 @@ class GaussianTrainer:
         
         self.logger.info(f"Saved history: {path}")
     
-    # Add these methods to the GaussianTrainer class
-
     # =============================================================================
     # CHECKPOINT LOADING AND EXPORT METHODS
     # =============================================================================
@@ -617,8 +815,6 @@ class GaussianTrainer:
         Returns:
             Path to saved file
         """
-        import numpy as np
-        
         # Use default path in final_outputs if not provided
         if save_path is None:
             save_path = self.run_manager.final_outputs_dir / f'splat_iter{self.current_iteration:06d}.ply'
@@ -639,6 +835,7 @@ class GaussianTrainer:
             scales = torch.exp(params['scale_raw']).cpu().numpy()
             rotation = params['rotation'].cpu().numpy()
             colors = params['color'].cpu().numpy()
+            object_ids = params['object_ids'].cpu().numpy()
             
             # Validate and clip colors to [0, 1] range
             colors = np.clip(colors, 0, 1)
@@ -650,23 +847,20 @@ class GaussianTrainer:
             
             # Log color statistics for debugging
             self.logger.info(f"  Color stats: min={colors.min():.3f}, max={colors.max():.3f}, mean={colors.mean():.3f}")
-            self.logger.info(f"  Color uint8: min={colors_uint8.min()}, max={colors_uint8.max()}, mean={colors_uint8.mean():.1f}")
+            self.logger.info(f"  Exporting {num_gaussians:,} Gaussians with {self.model.num_objects} instance classes")
         
-        # Write PLY file with colors IMMEDIATELY after xyz for Open3D compatibility
-        # Open3D expects: x, y, z, red, green, blue (in that order, adjacent)
+        # Write PLY file with instance IDs included
         with open(save_path, 'w') as f:
-            # Header - CRITICAL: put rgb right after xyz
+            # Header
             f.write("ply\n")
             f.write("format ascii 1.0\n")
             f.write(f"element vertex {num_gaussians}\n")
-            # Standard properties first (Open3D reads these)
             f.write("property float x\n")
             f.write("property float y\n")
             f.write("property float z\n")
             f.write("property uchar red\n")
             f.write("property uchar green\n")
             f.write("property uchar blue\n")
-            # Custom Gaussian splatting properties after
             f.write("property float opacity\n")
             f.write("property float scale_0\n")
             f.write("property float scale_1\n")
@@ -675,21 +869,18 @@ class GaussianTrainer:
             f.write("property float rot_1\n")
             f.write("property float rot_2\n")
             f.write("property float rot_3\n")
+            f.write("property int instance_id\n")  # Added instance ID
             f.write("end_header\n")
             
-            # Data - write in same order as header (xyz, rgb, then custom)
+            # Data
             for i in range(num_gaussians):
-                # Position
                 f.write(f"{pos[i,0]:.6f} {pos[i,1]:.6f} {pos[i,2]:.6f} ")
-                # Colors as integers (uchar format)
                 f.write(f"{int(colors_uint8[i,0])} {int(colors_uint8[i,1])} {int(colors_uint8[i,2])} ")
-                # Opacity
                 op_val = opacity[i,0] if opacity.ndim > 1 else opacity[i]
                 f.write(f"{op_val:.6f} ")
-                # Scales
                 f.write(f"{scales[i,0]:.6f} {scales[i,1]:.6f} {scales[i,2]:.6f} ")
-                # Rotation quaternion
-                f.write(f"{rotation[i,0]:.6f} {rotation[i,1]:.6f} {rotation[i,2]:.6f} {rotation[i,3]:.6f}\n")
+                f.write(f"{rotation[i,0]:.6f} {rotation[i,1]:.6f} {rotation[i,2]:.6f} {rotation[i,3]:.6f} ")
+                f.write(f"{int(object_ids[i])}\n")
         
         self.logger.info(f"Saved {num_gaussians:,} Gaussians to {save_path}")
         self.model.train()
@@ -699,7 +890,7 @@ class GaussianTrainer:
     def export_final_outputs(self, include_ply=True, include_comparison_grid=True, 
                          render_scale=0.5):
         """
-        Export all final outputs: PLY, test renders, comparison grid, and clean model checkpoint.
+        Export all final outputs: PLY, test renders, comparison grid, per-object PLYs.
         
         Args:
             include_ply: Whether to export .ply file
@@ -725,7 +916,7 @@ class GaussianTrainer:
         self.render_test_sequence(output_dir=render_dir, save_comparison=True, scale=render_scale)
         exports['renders'] = render_dir
         
-        # 3. Comparison grid - reuse show_test_grid with save_path
+        # 3. Comparison grid
         if include_comparison_grid:
             grid_path = self.run_manager.final_outputs_dir / 'all_comparisons.png'
             exports['comparison_grid'] = self.show_test_grid(
@@ -733,7 +924,12 @@ class GaussianTrainer:
                 save_path=grid_path
             )
         
-        # 4. Clean model checkpoint
+        # 4. Export per-object PLYs
+        objects_dir = self.run_manager.final_outputs_dir / 'objects'
+        self.model.export_all_objects_ply(str(objects_dir), min_opacity=0.1)
+        exports['objects'] = objects_dir
+        
+        # 5. Clean model checkpoint
         clean_model_path = self.run_manager.final_outputs_dir / f'model_iter{self.current_iteration:06d}.pth'
         torch.save({
             'iteration': self.current_iteration,
@@ -741,6 +937,8 @@ class GaussianTrainer:
             'config': self.config,
             'scene_name': self.run_manager.scene_name,
             'run_name': self.run_manager.run_name,
+            'num_objects': self.model.num_objects,
+            'object_names': self.model.object_names,
         }, clean_model_path)
         exports['model'] = clean_model_path
         
@@ -895,7 +1093,6 @@ class GaussianTrainer:
         else:
             return fig
     
-    
     def show_progress_grid(self, cols: int = 5, figsize_per_image: float = 3.0):
         """
         Display training progress renders in a grid (for Jupyter notebooks).
@@ -959,3 +1156,31 @@ class GaussianTrainer:
         plt.tight_layout()
         
         return fig
+    
+    def render_single_object(self, object_id: int, camera=None):
+        """
+        Render a single object by filtering Gaussians.
+        
+        Args:
+            object_id: Instance ID to render
+            camera: Camera to use (defaults to first test camera)
+            
+        Returns:
+            rendered_rgb: [3, H, W] RGB image of just that object
+        """
+        if camera is None:
+            camera = self.test_cameras[0]
+        
+        self.model.eval()
+        
+        with torch.no_grad():
+            params = self.model.get_parameters_as_tensors(object_mask=[object_id])
+            
+            if params['num_gaussians'] == 0:
+                self.logger.warning(f"No Gaussians found for object {object_id}")
+                return None
+            
+            rendered, _, _ = self.render(camera, params)
+        
+        self.model.train()
+        return rendered
