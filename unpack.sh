@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Usage: ./reassemble_and_unpack.sh <input_name>
-# Example: ./reassemble_and_unpack.sh my_big_file
+# Usage: ./unpack.sh <input_name>
+# Example: ./unpack.sh my_big_file
 
 set -e
 
