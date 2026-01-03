@@ -1,6 +1,6 @@
 """
 Record3D data loader for Gaussian Splatting
-WITH SEMANTIC SEGMENTATION SUPPORT
+WITH SEMANTIC SEGMENTATION SUPPORT (STREAMING VERSION)
 
 Expected scene structure:
 
@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -48,9 +48,16 @@ except ImportError:
     HAS_OPEN3D = False
     print("Warning: Open3D not installed. Point cloud I/O will be limited.")
 
-# ✅ Processing entry points
+# ✅ Processing entry points (streaming version)
 from scene.data_loaders.raw_pc_processing import (
     create_raw_pointcloud,
+    streaming_voxel_filter,
+    remove_small_clusters_label_aware,
+    statistical_outlier_removal,
+    remove_disconnected_chunks,
+    remap_object_ids,
+    print_semantic_summary,
+    # Legacy wrapper still available if needed
     process_pointcloud_with_semantics,
 )
 
@@ -345,53 +352,94 @@ def parse_pose(meta: Dict[str, Any], frame_idx: int) -> np.ndarray:
 # Point Cloud Creation
 # =============================================================================
 
-def create_point_cloud_from_rgbd(cam: Record3DCamera, subsample: int = 4) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+def create_point_cloud_from_rgbd(
+    cam: "Record3DCamera",
+    subsample: int = 4,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Create a point cloud from RGB-D camera data WITH SEMANTIC LABELS.
-    Returns: points (Nx3), colors (Nx3), object_ids (N,)
+    GPU-first implementation: keeps all math on cam.depth_map/c2w device,
+    only moves to CPU at the end for numpy outputs.
+
+    Returns:
+        points:    (N,3) float32 numpy
+        colors:    (N,3) float32 numpy in [0,1] (or whatever your original_image uses)
+        object_ids:(N,)  int32 numpy
     """
     if cam.depth_map is None:
         return None, None, None
 
-    H, W = cam.depth_map.shape
+    # Choose device/dtype from depth_map (or c2w). This prevents CPU/CUDA mixing.
+    device = cam.depth_map.device if isinstance(cam.depth_map, torch.Tensor) else torch.device("cpu")
+    depth = cam.depth_map.to(device)
 
-    u = torch.arange(0, W, subsample, dtype=torch.float32)
-    v = torch.arange(0, H, subsample, dtype=torch.float32)
+    H, W = depth.shape
+
+    # Build subsampled pixel grid ON DEVICE
+    u = torch.arange(0, W, subsample, device=device, dtype=torch.float32)
+    v = torch.arange(0, H, subsample, device=device, dtype=torch.float32)
     u_grid, v_grid = torch.meshgrid(u, v, indexing="xy")
-    u_flat = u_grid.flatten()
-    v_flat = v_grid.flatten()
+    u_flat = u_grid.reshape(-1)
+    v_flat = v_grid.reshape(-1)
 
-    depth_flat = cam.depth_map[v_flat.long(), u_flat.long()]
+    # Sample depth
+    depth_flat = depth[v_flat.long(), u_flat.long()]
     valid = (depth_flat > 0) & torch.isfinite(depth_flat)
+
+    if not torch.any(valid):
+        return None, None, None
 
     u_valid = u_flat[valid]
     v_valid = v_flat[valid]
     depth_valid = depth_flat[valid]
 
-    if len(depth_valid) == 0:
-        return None, None, None
+    # Intrinsics to device/dtype
+    fx = torch.as_tensor(cam.fx, device=device, dtype=torch.float32)
+    fy = torch.as_tensor(cam.fy, device=device, dtype=torch.float32)
+    cx = torch.as_tensor(cam.cx, device=device, dtype=torch.float32)
+    cy = torch.as_tensor(cam.cy, device=device, dtype=torch.float32)
 
-    fx, fy = cam.fx, cam.fy
-    cx, cy = cam.cx, cam.cy
-
+    # Camera-space points
     x_cam = (u_valid - cx) * depth_valid / fx
     y_cam = -(v_valid - cy) * depth_valid / fy
     z_cam = -depth_valid
-    points_cam = torch.stack([x_cam, y_cam, z_cam], dim=1)
+    points_cam = torch.stack([x_cam, y_cam, z_cam], dim=1)  # [N,3]
 
-    ones = torch.ones(len(points_cam), 1)
-    points_cam_hom = torch.cat([points_cam, ones], dim=1)
-    points_world_hom = points_cam_hom @ cam.c2w.T
-    points_world = points_world_hom[:, :3]
-
-    rgb_flat = cam.original_image[:, v_valid.long(), u_valid.long()].T  # [N,3]
-
-    if cam.object_mask is not None:
-        object_ids = cam.object_mask[v_valid.long(), u_valid.long()].cpu().numpy().astype(np.int32)
+    # Homogeneous transform (ALL ON DEVICE)
+    c2w = cam.c2w
+    if not isinstance(c2w, torch.Tensor):
+        c2w = torch.as_tensor(c2w, device=device, dtype=torch.float32)
     else:
-        object_ids = np.zeros(len(points_world), dtype=np.int32)
+        c2w = c2w.to(device=device, dtype=torch.float32)
 
-    return points_world.cpu().numpy(), rgb_flat.cpu().numpy(), object_ids
+    ones = torch.ones((points_cam.shape[0], 1), device=device, dtype=points_cam.dtype)
+    points_cam_hom = torch.cat([points_cam, ones], dim=1)  # [N,4]
+    points_world_hom = points_cam_hom @ c2w.T
+    points_world = points_world_hom[:, :3]  # [N,3]
+
+    # Colors (keep on device, move at end)
+    img = cam.original_image
+    if not isinstance(img, torch.Tensor):
+        img = torch.as_tensor(img)
+    img = img.to(device)
+    rgb_flat = img[:, v_valid.long(), u_valid.long()].T.contiguous()  # [N,3]
+
+    # Object IDs
+    if cam.object_mask is not None:
+        om = cam.object_mask
+        if not isinstance(om, torch.Tensor):
+            om = torch.as_tensor(om)
+        om = om.to(device)
+        object_ids = om[v_valid.long(), u_valid.long()].to(torch.int32)
+    else:
+        object_ids = torch.zeros((points_world.shape[0],), device=device, dtype=torch.int32)
+
+    # Return CPU numpy
+    return (
+        points_world.detach().cpu().numpy().astype(np.float32, copy=False),
+        rgb_flat.detach().cpu().numpy().astype(np.float32, copy=False),
+        object_ids.detach().cpu().numpy().astype(np.int32, copy=False),
+    )
 
 
 # =============================================================================
@@ -446,7 +494,7 @@ def save_processed_pointcloud_with_semantics(scene_path: Path, points: np.ndarra
 
 
 # =============================================================================
-# Reconstruction
+# Frame Generator (STREAMING)
 # =============================================================================
 
 def _find_rgb_path(scene_path: Path, idx: int) -> Optional[Path]:
@@ -486,6 +534,57 @@ def _load_class_mapping(scene_path: Path) -> Optional[Dict[Any, Any]]:
     return cm
 
 
+def create_frame_generator(
+    scene_path: Path,
+    frame_indices: List[int],
+    meta: Dict[str, Any],
+    masks_dir: Optional[Path],
+    subsample: int = 4,
+    verbose: bool = True,
+) -> Generator[Tuple[np.ndarray, np.ndarray, np.ndarray], None, None]:
+    """
+    Generator that yields (points, colors, object_ids) per frame.
+    Loads and processes one frame at a time to minimize memory.
+    """
+    from tqdm import tqdm
+    
+    iterator = tqdm(frame_indices, desc="Processing frames") if verbose else frame_indices
+    
+    for idx in iterator:
+        K, width, height = parse_intrinsics(meta, idx)
+        c2w = parse_pose(meta, idx)
+        
+        rgb_path = _find_rgb_path(scene_path, idx)
+        if rgb_path is None:
+            continue
+        
+        depth_path = scene_path / "EXR_RGBD" / "depth" / f"{idx}.exr"
+        mask_path = _find_mask_path(masks_dir, idx) if masks_dir else None
+        
+        cam = Record3DCamera(
+            image_path=rgb_path,
+            depth_path=depth_path,
+            c2w=c2w,
+            K=K,
+            width=width,
+            height=height,
+            camera_id=idx,
+            image_name=str(idx),
+            mask_path=mask_path,
+        )
+        
+        pts, cols, obj_ids = create_point_cloud_from_rgbd(cam, subsample=subsample)
+        
+        if pts is not None and len(pts) > 0:
+            yield (pts, cols, obj_ids)
+        
+        # Camera and frame data go out of scope here, memory freed
+
+
+# =============================================================================
+# Reconstruction (STREAMING)
+# =============================================================================
+
 def reconstruct_from_rgbd_with_semantics(
     scene_path: Path,
     frame_indices: List[int],
@@ -498,31 +597,35 @@ def reconstruct_from_rgbd_with_semantics(
 
     # semantic voting
     prefer_nonzero: bool = True,
-    min_nonzero_votes: int = 2,
-    min_nonzero_ratio: float = 0.10,
+    min_nonzero_votes: int = 1,
+    min_nonzero_ratio: float = 0.05,
     background_id: int = 0,
 
     # cluster + outlier
-    cluster_eps: float = 0.10,
-    min_cluster_size: int = 50,
-    keep_largest_n: Optional[int] = None,  # ✅ default safe for multi-object scenes
+    cluster_eps: float = 0.05,
+    min_cluster_size: int = 20,
     use_sor: bool = True,
     nb_neighbors: int = 20,
-    std_ratio: float = 1.5,
+    std_ratio: float = 2.5,
 
-    # ✅ remap
-    remap_min_points: int = 50,
+    # remap
+    remap_min_points: int = 15,
     save_remapped_mapping: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Reconstruct point cloud from RGBD frames WITH semantic labels,
-    then filter using semantic-preserving processing.
+    Reconstruct point cloud from RGBD frames WITH semantic labels.
+    STREAMING IMPLEMENTATION - processes frames incrementally.
 
     Expects masks in: scene_path/object_id_masks/
     Expects class mapping in: scene_path/class_mapping.json (optional)
+    
+    Pipeline (each step can be commented out for testing):
+        1. streaming_voxel_filter - multiview filtering with semantic voting
+        2. remove_small_clusters_label_aware - DBSCAN (protects labeled points)
+        3. statistical_outlier_removal - SOR cleanup
+        4. remove_disconnected_chunks - remove floating artifacts
+        5. remap_object_ids - contiguous ID assignment
     """
-    from tqdm import tqdm
-
     scene_path = Path(scene_path)
     meta = load_record3d_metadata(scene_path)
 
@@ -530,10 +633,10 @@ def reconstruct_from_rgbd_with_semantics(
     has_masks = masks_dir.exists()
 
     class_mapping = _load_class_mapping(scene_path) if has_masks else None
+    
     if has_masks:
         print(f"✓ Found masks directory: {masks_dir}")
         if class_mapping is not None:
-            # try to summarize if mapping values look like dicts with class_name
             try:
                 cm_keys = [k for k in class_mapping.keys()]
                 print(f"  Loaded class mapping with {len(cm_keys)} entries")
@@ -544,78 +647,92 @@ def reconstruct_from_rgbd_with_semantics(
     else:
         print("⚠️  No masks directory found - using object_id=0 for all points")
 
-    points_by_frame: List[np.ndarray] = []
-    colors_by_frame: List[np.ndarray] = []
-    object_ids_by_frame: List[np.ndarray] = []
+    print(f"\n{'='*60}")
+    print("POINT CLOUD PROCESSING WITH SEMANTICS (STREAMING)")
+    print(f"{'='*60}")
+    print(f"Processing {len(frame_indices)} frames...")
 
-    print(f"\nReconstructing from {len(frame_indices)} RGBD frames...")
-
-    for idx in tqdm(frame_indices, desc="Processing frames"):
-        K, width, height = parse_intrinsics(meta, idx)
-        c2w = parse_pose(meta, idx)
-
-        rgb_path = _find_rgb_path(scene_path, idx)
-        if rgb_path is None:
-            continue
-
-        depth_path = scene_path / "EXR_RGBD" / "depth" / f"{idx}.exr"
-        mask_path = _find_mask_path(masks_dir, idx) if has_masks else None
-
-        cam = Record3DCamera(
-            image_path=rgb_path,
-            depth_path=depth_path,
-            c2w=c2w,
-            K=K,
-            width=width,
-            height=height,
-            camera_id=idx,
-            image_name=str(idx),
-            mask_path=mask_path,
-        )
-
-        pts, cols, obj_ids = create_point_cloud_from_rgbd(cam, subsample=subsample)
-        if pts is not None and len(pts) > 0:
-            points_by_frame.append(pts)
-            colors_by_frame.append(cols)
-            object_ids_by_frame.append(obj_ids)
-
-    if len(points_by_frame) == 0:
-        print("Warning: No valid frames processed")
-        return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32), np.zeros((0,), dtype=np.int32)
-
-    print(f"Total raw points: {sum(len(p) for p in points_by_frame):,}")
-    print("\n✓ Applying multiview filtering with semantic-preserving voting...")
-
-    # Return mappings so we can optionally save remapped mapping json
-    points, colors, object_ids, new_class_mapping, id_remap = process_pointcloud_with_semantics(
-        points_by_frame,
-        colors_by_frame,
-        object_ids_by_frame,
-
+    # =========================================================================
+    # Step 1: Streaming voxel filter with semantic voting
+    # =========================================================================
+    frame_gen = create_frame_generator(
+        scene_path,
+        frame_indices,
+        meta,
+        masks_dir if has_masks else None,
+        subsample=subsample,
+        verbose=True,
+    )
+    
+    points, colors, obj_ids = streaming_voxel_filter(
+        frame_gen,
         voxel_size=voxel_size,
         min_views=min_views,
-
         prefer_nonzero=prefer_nonzero,
         min_nonzero_votes=min_nonzero_votes,
         min_nonzero_ratio=min_nonzero_ratio,
         background_id=background_id,
+        verbose=True,
+    )
+    
+    if len(points) == 0:
+        print("WARNING: No points remaining after voxel filtering!")
+        return points, colors, obj_ids
 
-        cluster_eps=cluster_eps,
+    # =========================================================================
+    # Step 2: Label-aware cluster cleaning (DBSCAN)
+    # Comment out this block to skip DBSCAN
+    # =========================================================================
+    points, colors, obj_ids = remove_small_clusters_label_aware(
+        points, colors, obj_ids,
+        eps=cluster_eps,
         min_cluster_size=min_cluster_size,
-        keep_largest_n=keep_largest_n,  # ✅ default None for multi-object
-
-        use_sor=use_sor,
-        nb_neighbors=nb_neighbors,
-        std_ratio=std_ratio,
-
-        remap_ids=True,
-        remap_min_points=remap_min_points,
-        class_mapping=class_mapping,
-        verbose_remap=True,
-
-        return_mappings=True,
+        background_id=background_id,
+        verbose=True,
     )
 
+    # =========================================================================
+    # Step 3: Statistical outlier removal
+    # Comment out this block to skip SOR
+    # =========================================================================
+    if use_sor and len(points) > 0:
+        points, colors, obj_ids = statistical_outlier_removal(
+            points, colors, obj_ids,
+            nb_neighbors=nb_neighbors,
+            std_ratio=std_ratio,
+            verbose=True,
+        )
+
+    # =========================================================================
+    # Step 4: Remove disconnected chunks (floating artifacts)
+    # Comment out this block to skip chunk removal
+    # =========================================================================
+    points, colors, obj_ids = remove_disconnected_chunks(
+        points, colors, obj_ids,
+        eps=0.15,        # Points within 15cm are neighbors
+        min_samples=10,  # Need 10+ points to form a cluster core
+        verbose=True,
+    )
+
+    # =========================================================================
+    # Step 5: Remap object IDs to contiguous values
+    # Comment out this block to skip remapping
+    # =========================================================================
+    new_class_mapping: Dict[str, Any] = {"0": "background"}
+    id_remap: Dict[int, int] = {background_id: 0}
+    
+    if len(obj_ids) > 0:
+        obj_ids, new_class_mapping, id_remap = remap_object_ids(
+            obj_ids,
+            class_mapping=class_mapping,
+            min_points=remap_min_points,
+            background_id=background_id,
+            verbose=True,
+        )
+
+    # =========================================================================
+    # Save remapped mapping files
+    # =========================================================================
     if save_remapped_mapping and new_class_mapping is not None:
         try:
             out_map_path = scene_path / "class_mapping_remapped.json"
@@ -626,12 +743,15 @@ def reconstruct_from_rgbd_with_semantics(
             with open(out_remap_path, "w") as f:
                 json.dump({str(k): int(v) for k, v in id_remap.items()}, f, indent=2)
 
-            print(f"Saved remapped class mapping to {out_map_path}")
+            print(f"\nSaved remapped class mapping to {out_map_path}")
             print(f"Saved id remap to {out_remap_path}")
         except Exception as e:
             print(f"Warning: could not save remapped mapping files: {e}")
 
-    return points, colors, object_ids
+    # Print final summary
+    print_semantic_summary(obj_ids, new_class_mapping)
+
+    return points, colors, obj_ids
 
 
 # =============================================================================
@@ -639,7 +759,7 @@ def reconstruct_from_rgbd_with_semantics(
 # =============================================================================
 
 class Record3DScene:
-    """Scene loader for Record3D data WITH semantic support."""
+    """Scene loader for Record3D data WITH semantic support (STREAMING)."""
 
     def __init__(
         self,
@@ -655,22 +775,21 @@ class Record3DScene:
 
         # semantic voting knobs
         prefer_nonzero: bool = True,
-        min_nonzero_votes: int = 2,
-        min_nonzero_ratio: float = 0.20,
+        min_nonzero_votes: int = 1,
+        min_nonzero_ratio: float = 0.05,
         background_id: int = 0,
 
         # processing knobs
         voxel_size: float = 0.01,
         min_views: int = 2,
-        cluster_eps: float = 0.10,
-        min_cluster_size: int = 50,
-        keep_largest_n: Optional[int] = None,  # ✅ default multi-object safe
+        cluster_eps: float = 0.05,
+        min_cluster_size: int = 20,
         use_sor: bool = True,
         nb_neighbors: int = 20,
-        std_ratio: float = 1.5,
+        std_ratio: float = 2.5,
 
-        # ✅ new: semantic cleanup/remap
-        remap_min_points: int = 50,
+        # semantic cleanup/remap
+        remap_min_points: int = 15,
     ):
         self.scene_path = Path(scene_path)
         self.model_path = str(self.scene_path)
@@ -714,14 +833,21 @@ class Record3DScene:
         if not self.use_semantics or not self.has_masks:
             raise NotImplementedError("Non-semantic path omitted - add legacy code if needed.")
 
-        semantic_exists = (self.scene_path / "processed_semantic.ply").exists() and (self.scene_path / "object_ids.npy").exists()
+        semantic_exists = (
+            (self.scene_path / "processed_semantic.ply").exists() 
+            and (self.scene_path / "object_ids.npy").exists()
+        )
 
         if semantic_exists and not redo_semantics:
             points, colors, object_ids = load_processed_pointcloud_with_semantics(self.scene_path)
             if points is None:
-                points, colors, object_ids = np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32), np.zeros((0,), np.int32)
+                points, colors, object_ids = (
+                    np.zeros((0, 3), np.float32),
+                    np.zeros((0, 3), np.float32),
+                    np.zeros((0,), np.int32),
+                )
         else:
-            print("Creating semantic point cloud...")
+            print("Creating semantic point cloud (streaming)...")
             points, colors, object_ids = reconstruct_from_rgbd_with_semantics(
                 self.scene_path,
                 frame_indices=train_frames,
@@ -737,7 +863,6 @@ class Record3DScene:
 
                 cluster_eps=cluster_eps,
                 min_cluster_size=min_cluster_size,
-                keep_largest_n=keep_largest_n,
 
                 use_sor=use_sor,
                 nb_neighbors=nb_neighbors,

@@ -20,6 +20,10 @@ Includes:
    - training render with packed=True
    - retain pos grads and accumulate visible gradient magnitude stats
    - every densify_interval: densify above densify_grad_threshold and prune below prune_opacity_threshold
+7) FLOATER PREVENTION:
+   - Offset-distance penalty (soft leash) to prevent Gaussians from drifting far from anchors
+   - Adaptive hard cap based on local anchor density (nearest neighbor distance)
+   - Controlled by `lambda_offset_leash` and `adaptive_offset_cap_multiplier` config parameters
 """
 
 from __future__ import annotations
@@ -46,10 +50,6 @@ except Exception:
 
 
 def _save_image_tensor(img_chw: torch.Tensor, path: Path) -> None:
-    """
-    Minimal replacement for torchvision.utils.save_image to avoid torchvision dependency.
-    Expects img in [C,H,W], float in [0,1].
-    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     img = img_chw.detach().cpu().clamp(0, 1)
@@ -61,10 +61,6 @@ def _save_image_tensor(img_chw: torch.Tensor, path: Path) -> None:
         im = Image.fromarray(arr, mode="RGB")
     im.save(str(path))
 
-
-# =============================================================================
-# Output directory manager
-# =============================================================================
 
 class RunManager:
     def __init__(self, base_dir: str, scene_name: str):
@@ -101,7 +97,6 @@ def setup_training_logger(run_manager: RunManager) -> logging.Logger:
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    # avoid duplicated handlers if reloaded
     if len(logger.handlers) > 0:
         return logger
 
@@ -120,10 +115,6 @@ def setup_training_logger(run_manager: RunManager) -> logging.Logger:
     logger.info("=" * 70)
     return logger
 
-
-# =============================================================================
-# Top-K checkpoint manager
-# =============================================================================
 
 @dataclass
 class CKPTRecord:
@@ -176,10 +167,6 @@ class TopKCheckpointManager:
         self.records = sorted(self.records, key=self._sort_key)
 
 
-# =============================================================================
-# Trainer
-# =============================================================================
-
 class GaussianTrainer:
     def __init__(
         self,
@@ -195,69 +182,50 @@ class GaussianTrainer:
         self.model = model
         self.scene = scene
 
-        # =================================================================
-        # DEFAULT CONFIG - MATCHED TO SUCCESSFUL RUN 3
-        # =================================================================
         defaults: Dict = {
-            # training iterations
-            "num_iterations": 40000,  # was 20000, Run 3 used 40000
-            
-            # per-parameter learning rates (CRITICAL - from Run 3)
-            "lr": 0.001,              # base/mlp LR - was 0.01, Run 3 used 0.001
-            "lr_feature": 0.0025,     # anchor features LR
-            "lr_position": 0.00016,   # anchor offsets (position) LR
-            "lr_scaling": 0.005,      # anchor scalings LR
-            
-            # evaluation and checkpointing
-            "eval_interval": 1000,    # was 500, Run 3 used 1000
+            "num_iterations": 40000,
+            "lr": 0.001,
+            "lr_feature": 0.0025,
+            "lr_position": 0.00016,
+            "lr_scaling": 0.005,
+            "eval_interval": 1000,
             "progress_render_scale": 0.5,
             "checkpoint_topk": 3,
             "checkpoint_metric": "test_l1",
             "lower_is_better": True,
-
-            # progressive resolution schedule - DISABLED by default (Run 3 didn't use it)
             "use_progressive_resolution": False,
-            "progressive_resolution_schedule": [
-                (0.05, 4),   # first 5%: 4x downscale
-                (0.15, 2),   # next 15%: 2x downscale  
-                (0.80, 1),   # remaining 80%: full res
-            ],
-
-            # semantic loss (matched to Run 3)
+            "progressive_resolution_schedule": [(0.05, 4), (0.15, 2), (0.80, 1)],
             "use_semantic_loss": True,
-            "lambda_semantic": 0.05,  # was 1.0, Run 3 used 0.05
-            "semantic_loss_start": 2000,  # was 0, Run 3 used 2000
-            "semantic_warmup_iters": 0,   # Run 3 didn't use warmup
+            "lambda_semantic": 0.05,
+            "semantic_loss_start": 2000,
+            "semantic_warmup_iters": 0,
             "semantic_ignore_index": -1,
             "semantic_min_valid_fraction": 0.005,
-
-            # rgb losses (matched to Run 3)
-            "lambda_ssim": 0.3,  # was 0.2, Run 3 used 0.3
-
-            # regularization (matched to Run 3)
-            "lambda_volume": 0.0001,  # Run 3 used 0.0001
-            "lambda_scale_reg": 1.0,  # Run 3 used lambda_scale: 1.0
+            "lambda_ssim": 0.3,
+            "lambda_volume": 0.0001,
+            "lambda_scale_reg": 1.0,
             "scale_threshold": 0.03,
             "max_scale": 0.1,
-
-            # densify/prune (matched to Run 3)
+            # FLOATER PREVENTION
+            "lambda_offset_leash": 0.5,
+            "adaptive_offset_cap_multiplier": 2.0,
+            "nn_recompute_interval": 1000,
+            # Densification
             "use_densification": True,
             "densify_start": 1000,
-            "densify_until": 25000,  # Run 3 had this
+            "densify_until": 25000,
             "densify_interval": 1000,
             "densify_grad_threshold": 5e-5,
-            "prune_opacity_threshold": 0.01,
-            "min_opacity": 0.001,  # Run 3 had this
-
-            # early stopping (based on checkpoint_metric)
-            "early_stop_patience_evals": 20,  # increased patience
+            "prune_opacity_threshold": 0.02,
+            "min_opacity": 0.01,
+            "prune_warmup_iters": 0,
+            "early_stop_patience_evals": 20,
         }
 
         self.config = dict(defaults)
         if config is not None:
             self.config.update(config)
 
-        # Backward-compatible mapping from old lowres settings
         if ("lowres_scale" in self.config) or ("lowres_until" in self.config):
             ls = float(self.config.get("lowres_scale", 1.0))
             lu = int(self.config.get("lowres_until", 0))
@@ -276,11 +244,8 @@ class GaussianTrainer:
         self.train_cameras = self.scene.getTrainCameras()
         self.test_cameras = self.scene.getTestCameras()
 
-        # =================================================================
-        # PER-PARAMETER LEARNING RATES (CRITICAL FIX)
-        # =================================================================
         self.optimizer = self._build_optimizer()
-        
+
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
             T_max=int(self.config["num_iterations"]),
@@ -294,8 +259,6 @@ class GaussianTrainer:
 
         self.current_iteration = 0
         self.losses_history: List[Dict] = []
-
-        # semantic eval cache
         self.last_semantic_eval_loss: float = 0.0
 
         self._schedule_bounds: List[Tuple[int, int]] = self._compute_progressive_bounds(
@@ -303,187 +266,333 @@ class GaussianTrainer:
             self.config.get("progressive_resolution_schedule", []),
         )
 
+        self._anchor_nn_distances: Optional[torch.Tensor] = None
+        self._last_nn_compute_iter: int = -1
+        self._last_nn_anchor_count: int = -1
+        
+        if float(self.config.get("adaptive_offset_cap_multiplier", 0.0)) > 0.0:
+            self._compute_anchor_nn_distances()
+
         self._log_initialization()
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
-        """
-        Build optimizer with per-parameter learning rates.
-        This matches Run 3's successful configuration.
-        """
         lr_base = float(self.config.get("lr", 0.001))
         lr_feature = float(self.config.get("lr_feature", 0.0025))
         lr_position = float(self.config.get("lr_position", 0.00016))
         lr_scaling = float(self.config.get("lr_scaling", 0.005))
-        
-        # Collect parameters into groups
+
         param_groups = []
-        
-        # Group 1: anchor_features
+
         if hasattr(self.model, 'anchor_features') and self.model.anchor_features is not None:
-            param_groups.append({
-                'params': [self.model.anchor_features],
-                'lr': lr_feature,
-                'name': 'features'
-            })
-        
-        # Group 2: anchor_scalings
+            param_groups.append({'params': [self.model.anchor_features], 'lr': lr_feature, 'name': 'features'})
+
         if hasattr(self.model, 'anchor_scalings') and self.model.anchor_scalings is not None:
-            param_groups.append({
-                'params': [self.model.anchor_scalings],
-                'lr': lr_scaling,
-                'name': 'scalings'
-            })
-        
-        # Group 3: anchor_offsets (positions)
+            param_groups.append({'params': [self.model.anchor_scalings], 'lr': lr_scaling, 'name': 'scalings'})
+
         if hasattr(self.model, 'anchor_offsets') and self.model.anchor_offsets is not None:
-            param_groups.append({
-                'params': [self.model.anchor_offsets],
-                'lr': lr_position,
-                'name': 'offsets'
-            })
-        
-        # Group 4: MLP parameters (attribute_mlp)
+            param_groups.append({'params': [self.model.anchor_offsets], 'lr': lr_position, 'name': 'offsets'})
+
         mlp_params = []
         if hasattr(self.model, 'attribute_mlp') and self.model.attribute_mlp is not None:
             mlp_params = list(self.model.attribute_mlp.parameters())
-        
+
         if mlp_params:
-            param_groups.append({
-                'params': mlp_params,
-                'lr': lr_base,
-                'name': 'mlp'
-            })
-        
-        # Fallback: if no specific groups found, use all parameters
+            param_groups.append({'params': mlp_params, 'lr': lr_base, 'name': 'mlp'})
+
         if not param_groups:
             self.logger.warning("Could not identify parameter groups, using single LR for all params")
             param_groups = [{'params': self.model.parameters(), 'lr': lr_base, 'name': 'all'}]
-        
+
         optimizer = torch.optim.Adam(param_groups)
-        
-        # Log the parameter groups
+
         self.logger.info("Optimizer: Adam with %d param groups", len(param_groups))
         for pg in param_groups:
             name = pg.get('name', 'unnamed')
             lr = pg.get('lr', lr_base)
             n_params = sum(p.numel() for p in pg['params'])
             self.logger.info("  %s: lr=%.6f (%d params)", name, lr, n_params)
-        
+
         return optimizer
 
-    def _rebuild_optimizer_after_densify(self):
-        """
-        Rebuild optimizer after densification changes parameter shapes.
-        Preserves learning rate schedule state.
-        """
-        old_state = self.scheduler.state_dict()
-        self.optimizer = self._build_optimizer()
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
+    def _rebuild_optimizer_after_densify_preserve_state(
+        self,
+        old_optimizer: torch.optim.Optimizer,
+        old_scheduler: torch.optim.lr_scheduler._LRScheduler,
+        old_anchor_params: Dict[str, torch.Tensor],
+        mapping: Dict,
+    ):
+        old_sched_state = old_scheduler.state_dict()
+        new_optimizer = self._build_optimizer()
+
+        for group in new_optimizer.param_groups:
+            for p in group["params"]:
+                if p in old_optimizer.state:
+                    new_optimizer.state[p] = old_optimizer.state[p]
+
+        keep_old = mapping.get("keep_indices_old", None)
+        grow_old = mapping.get("grow_parent_old", None)
+        if isinstance(keep_old, torch.Tensor):
+            keep_old = keep_old.long()
+        if isinstance(grow_old, torch.Tensor):
+            grow_old = grow_old.long()
+
+        def _remap_adam_state(old_p: torch.Tensor, new_p: torch.Tensor):
+            if old_p not in old_optimizer.state:
+                return
+            st = old_optimizer.state[old_p]
+            if not isinstance(st, dict):
+                return
+            if "exp_avg" not in st or "exp_avg_sq" not in st:
+                return
+
+            exp_avg_old = st["exp_avg"]
+            exp_avg_sq_old = st["exp_avg_sq"]
+            step_old = st.get("step", 0)
+
+            exp_avg_new = torch.zeros_like(new_p.data)
+            exp_avg_sq_new = torch.zeros_like(new_p.data)
+
+            n_keep = int(keep_old.numel()) if keep_old is not None else 0
+            n_grow = int(grow_old.numel()) if grow_old is not None else 0
+
+            if keep_old is not None and n_keep > 0:
+                exp_avg_new[:n_keep].copy_(exp_avg_old[keep_old.to(exp_avg_old.device)])
+                exp_avg_sq_new[:n_keep].copy_(exp_avg_sq_old[keep_old.to(exp_avg_sq_old.device)])
+
+            if grow_old is not None and n_grow > 0:
+                exp_avg_new[n_keep:n_keep + n_grow].copy_(exp_avg_old[grow_old.to(exp_avg_old.device)])
+                exp_avg_sq_new[n_keep:n_keep + n_grow].copy_(exp_avg_sq_old[grow_old.to(exp_avg_sq_old.device)])
+
+            new_optimizer.state[new_p] = {"step": step_old, "exp_avg": exp_avg_new, "exp_avg_sq": exp_avg_sq_new}
+
+        try:
+            _remap_adam_state(old_anchor_params["anchor_features"], self.model.anchor_features)
+            _remap_adam_state(old_anchor_params["anchor_scalings"], self.model.anchor_scalings)
+            _remap_adam_state(old_anchor_params["anchor_offsets"], self.model.anchor_offsets)
+        except Exception as e:
+            self.logger.warning(f"Failed to remap Adam state for anchors: {e}")
+
+        new_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            new_optimizer,
             T_max=int(self.config["num_iterations"]),
             eta_min=float(self.config.get("lr", 0.001)) * 0.1,
         )
-        # Restore scheduler state (current step)
         try:
-            self.scheduler.load_state_dict(old_state)
-        except Exception:
-            # If state doesn't match, just set the step manually
-            self.scheduler.last_epoch = self.current_iteration
+            new_scheduler.load_state_dict(old_sched_state)
+        except Exception as e:
+            self.logger.warning(f"Failed to restore scheduler state: {e}")
+
+        self.optimizer = new_optimizer
+        self.scheduler = new_scheduler
 
     def _log_initialization(self):
-        """Log initialization info."""
-        self.logger.info("INITIALIZING GaussianTrainer")
-        self.logger.info("-" * 70)
+        self.logger.info("=" * 70)
+        self.logger.info("TRAINING CONFIGURATION")
+        self.logger.info("=" * 70)
+        for k, v in sorted(self.config.items()):
+            self.logger.info(f"  {k}: {v}")
         self.logger.info(f"Device: {self.device}")
-        self.logger.info(f"Train cams: {len(self.train_cameras)} | Test cams: {len(self.test_cameras)}")
-        self.logger.info(f"Iterations: {self.config['num_iterations']}")
+        self.logger.info(f"Train cameras: {len(self.train_cameras)}")
+        self.logger.info(f"Test cameras: {len(self.test_cameras)}")
+        self.logger.info(f"Model anchors: {self.model.num_anchors:,}")
+        self.logger.info(f"Model Gaussians: {self.model.num_gaussians:,}")
         
-        if self.config.get("use_progressive_resolution", False):
-            self.logger.info(f"Progressive schedule (end_iter, downscale): {self._schedule_bounds}")
+        leash_w = float(self.config.get("lambda_offset_leash", 0.0))
+        cap_mult = float(self.config.get("adaptive_offset_cap_multiplier", 0.0))
+        
+        if leash_w > 0:
+            self.logger.info(f"Offset leash enabled: lambda={leash_w}")
         else:
-            self.logger.info("Progressive resolution: DISABLED (training at full resolution)")
+            self.logger.info("Offset leash disabled (lambda_offset_leash=0)")
+            
+        if cap_mult > 0:
+            self.logger.info(f"Adaptive offset cap enabled: multiplier={cap_mult}")
+            if self._anchor_nn_distances is not None:
+                nn_min = float(self._anchor_nn_distances.min().item())
+                nn_max = float(self._anchor_nn_distances.max().item())
+                nn_mean = float(self._anchor_nn_distances.mean().item())
+                self.logger.info(f"  NN distances: min={nn_min:.4f}m, max={nn_max:.4f}m, mean={nn_mean:.4f}m")
+                self.logger.info(f"  Effective cap range: [{nn_min*cap_mult:.4f}m, {nn_max*cap_mult:.4f}m]")
+        else:
+            self.logger.info("Adaptive offset cap disabled (adaptive_offset_cap_multiplier=0)")
         
-        self.logger.info("-" * 70)
-        self.logger.info("Configuration:")
-        for key in sorted(self.config.keys()):
-            self.logger.info(f"  {key}: {self.config[key]}")
-        self.logger.info("-" * 70)
+        self.logger.info("=" * 70)
 
-    # -------------------------------------------------------------------------
-    # Progressive resolution helpers
-    # -------------------------------------------------------------------------
+    @torch.no_grad()
+    def _compute_anchor_nn_distances(self, force: bool = False) -> None:
+        """Compute nearest neighbor distance for each anchor for adaptive offset cap.
+        
+        Uses CPU computation with double-chunking to avoid GPU OOM on large anchor sets.
+        For 640k anchors, full pairwise distances would need ~1.5TB, so we use a 
+        chunked approach that processes small batches at a time.
+        """
+        cap_mult = float(self.config.get("adaptive_offset_cap_multiplier", 0.0))
+        if cap_mult <= 0.0:
+            return
+            
+        current_anchor_count = self.model.num_anchors
+        recompute_interval = int(self.config.get("nn_recompute_interval", 1000))
+        
+        need_recompute = (
+            force or
+            self._anchor_nn_distances is None or
+            self._last_nn_anchor_count != current_anchor_count or
+            (recompute_interval > 0 and self.current_iteration - self._last_nn_compute_iter >= recompute_interval)
+        )
+        
+        if not need_recompute:
+            return
+        
+        self.logger.info(f"[NN] Computing nearest neighbor distances for {current_anchor_count:,} anchors...")
+            
+        # Move to CPU for memory efficiency
+        positions = self.model.anchor_positions.detach().cpu().float()  # [N, 3]
+        N = positions.shape[0]
+        
+        if N <= 1:
+            self._anchor_nn_distances = torch.ones(N, device=self.device) * 0.1
+            return
+        
+        # For very large N, we can't compute full pairwise distances
+        # Instead, use a chunked approach on CPU
+        # Each anchor only needs to find its nearest neighbor, not all distances
+        
+        nn_distances = torch.full((N,), float('inf'), dtype=torch.float32)
+        
+        # Chunk size for query points (rows)
+        query_chunk = 5000
+        # Chunk size for reference points (cols) - keep small to limit memory
+        ref_chunk = 50000
+        
+        for q_start in range(0, N, query_chunk):
+            q_end = min(q_start + query_chunk, N)
+            query_pos = positions[q_start:q_end]  # [query_chunk, 3]
+            
+            # Track minimum distance for this query chunk
+            chunk_min_dist = torch.full((q_end - q_start,), float('inf'), dtype=torch.float32)
+            
+            for r_start in range(0, N, ref_chunk):
+                r_end = min(r_start + ref_chunk, N)
+                ref_pos = positions[r_start:r_end]  # [ref_chunk, 3]
+                
+                # Compute pairwise squared distances for this chunk pair
+                # query_pos: [Q, 3], ref_pos: [R, 3]
+                # diff: [Q, R, 3] -> sum over last dim -> [Q, R]
+                diff = query_pos.unsqueeze(1) - ref_pos.unsqueeze(0)  # [Q, R, 3]
+                dists_sq = (diff ** 2).sum(dim=-1)  # [Q, R]
+                
+                # Mask out self-distances (where query index == ref index)
+                for i in range(q_end - q_start):
+                    global_q_idx = q_start + i
+                    if r_start <= global_q_idx < r_end:
+                        local_r_idx = global_q_idx - r_start
+                        dists_sq[i, local_r_idx] = float('inf')
+                
+                # Update minimum distances
+                chunk_dists, _ = dists_sq.min(dim=1)  # [Q]
+                chunk_min_dist = torch.minimum(chunk_min_dist, chunk_dists)
+            
+            # Store results (take sqrt at the end)
+            nn_distances[q_start:q_end] = chunk_min_dist
+        
+        # Convert squared distances to distances
+        nn_distances = torch.sqrt(nn_distances)
+        
+        # Clamp to reasonable range
+        voxel_size = float(getattr(self.model, 'voxel_size', 0.02))
+        nn_distances = nn_distances.clamp(min=voxel_size * 0.5)
+        
+        # Move back to GPU
+        self._anchor_nn_distances = nn_distances.to(self.device)
+        self._last_nn_compute_iter = self.current_iteration
+        self._last_nn_anchor_count = current_anchor_count
+        
+        nn_min = float(nn_distances.min().item())
+        nn_max = float(nn_distances.max().item())
+        nn_mean = float(nn_distances.mean().item())
+        self.logger.info(f"[NN] Done. min={nn_min:.4f}m, max={nn_max:.4f}m, mean={nn_mean:.4f}m")
+
+    @torch.no_grad()
+    def _apply_adaptive_offset_cap(self) -> int:
+        """Apply adaptive hard cap on offsets based on local anchor density."""
+        cap_mult = float(self.config.get("adaptive_offset_cap_multiplier", 0.0))
+        if cap_mult <= 0.0:
+            return 0
+            
+        if self._anchor_nn_distances is None:
+            self._compute_anchor_nn_distances(force=True)
+            
+        if self._anchor_nn_distances is None:
+            return 0
+        
+        max_radius_per_anchor = self._anchor_nn_distances * cap_mult
+        
+        off = self.model.anchor_offsets.data
+        scl = self.model.anchor_scalings.data.view(-1, 1, 1)
+        
+        world_off = off * scl
+        dist = world_off.norm(dim=-1)
+        
+        max_radius = max_radius_per_anchor.view(-1, 1).expand_as(dist)
+        
+        exceed_mask = dist > max_radius
+        n_clamped = int(exceed_mask.sum().item())
+        
+        if n_clamped > 0:
+            safe_dist = dist.clamp(min=1e-8)
+            scale_factor = torch.where(exceed_mask, max_radius / safe_dist, torch.ones_like(dist))
+            
+            clamped_world_off = world_off * scale_factor.unsqueeze(-1)
+            safe_scl = scl.clamp(min=1e-8)
+            clamped_off = clamped_world_off / safe_scl
+            
+            self.model.anchor_offsets.data.copy_(clamped_off)
+        
+        return n_clamped
 
     @staticmethod
-    def _compute_progressive_bounds(num_iters: int, schedule: List[Tuple[float, int]]) -> List[Tuple[int, int]]:
-        bounds: List[Tuple[int, int]] = []
+    def _compute_progressive_bounds(n_iters: int, schedule: List) -> List[Tuple[int, int]]:
         if not schedule:
-            return [(num_iters, 1)]
-        fracs = [float(f) for f, _ in schedule]
-        s = sum(fracs)
-        if s <= 0:
-            return [(num_iters, 1)]
-        fracs = [f / s for f in fracs]
-        cum = 0.0
-        for frac, (_, ds) in zip(fracs, schedule):
-            cum += frac
-            end_iter = int(round(cum * num_iters))
-            bounds.append((max(1, end_iter), int(ds)))
-        if bounds[-1][0] != num_iters:
-            bounds[-1] = (num_iters, bounds[-1][1])
+            return [(1, 1, n_iters)]
+        bounds = []
+        cur = 1
+        for frac, ds in schedule:
+            length = max(1, int(frac * n_iters))
+            bounds.append((ds, cur, cur + length - 1))
+            cur += length
         return bounds
 
     def _current_downscale(self, iteration: int) -> int:
         if not self.config.get("use_progressive_resolution", False):
             return 1
-        it = int(iteration)
-        for end_it, ds in self._schedule_bounds:
-            if it <= end_it:
+        for ds, lo, hi in self._schedule_bounds:
+            if lo <= iteration <= hi:
                 return int(ds)
         return 1
 
-    def _get_downscaled_gt(self, camera, downscale: int):
-        """
-        Returns (gt_image[C,H,W], gt_mask[H,W] or None, K[3,3], W, H)
-        Caches downscaled tensors on the camera object.
-        """
-        downscale = int(max(1, downscale))
+    def _get_downscaled_gt(self, camera, downscale: int) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, int, int]:
+        img = camera._gt_image_gpu
+        mask = getattr(camera, "_gt_mask_gpu", None)
+        K = camera._K_gpu.clone()
+
         if downscale == 1:
-            gt_image = camera._gt_image_gpu
-            gt_mask = getattr(camera, "_gt_mask_gpu", None)
-            K = camera._K_gpu
-            W = int(camera.image_width)
-            H = int(camera.image_height)
-            return gt_image, gt_mask, K, W, H
+            H, W = int(img.shape[1]), int(img.shape[2])
+            return img, mask, K, W, H
 
         cache_key = f"_ds_{downscale}"
         if hasattr(camera, cache_key):
             cached = getattr(camera, cache_key)
             return cached["img"], cached.get("mask", None), cached["K"], cached["W"], cached["H"]
 
-        img = camera._gt_image_gpu  # [3,H,W]
-        mask = getattr(camera, "_gt_mask_gpu", None)  # [H,W] or None
-        K = camera._K_gpu.clone()
+        H = int(img.shape[1]) // downscale
+        W = int(img.shape[2]) // downscale
 
-        H0, W0 = img.shape[-2:]
-        H = int(H0 // downscale)
-        W = int(W0 // downscale)
-
-        img_ds = F.interpolate(
-            img.unsqueeze(0),
-            size=(H, W),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0).contiguous()
+        img_ds = F.interpolate(img[None], size=(H, W), mode="bilinear", align_corners=False).squeeze(0).contiguous()
 
         mask_ds = None
         if mask is not None:
-            mask_ds = F.interpolate(
-                mask[None, None].float(),
-                size=(H, W),
-                mode="nearest",
-            )[0, 0].long().contiguous()
+            mask_ds = F.interpolate(mask[None, None].float(), size=(H, W), mode="nearest")[0, 0].long().contiguous()
 
-        # scale intrinsics
         K[0, 0] = K[0, 0] / downscale
         K[1, 1] = K[1, 1] / downscale
         K[0, 2] = K[0, 2] / downscale
@@ -495,20 +604,7 @@ class GaussianTrainer:
         setattr(camera, cache_key, cached)
         return img_ds, mask_ds, K, W, H
 
-    # -------------------------------------------------------------------------
-    # Rendering
-    # -------------------------------------------------------------------------
-
-    def render_with_semantics(
-        self,
-        camera,
-        params=None,
-        K_override=None,
-        width_override=None,
-        height_override=None,
-        packed: bool = False,
-        model_override=None,
-    ):
+    def render_with_semantics(self, camera, params=None, K_override=None, width_override=None, height_override=None, packed: bool = False, model_override=None):
         src_model = model_override if model_override is not None else self.model
         if params is None:
             params = src_model.get_parameters_as_tensors()
@@ -516,6 +612,9 @@ class GaussianTrainer:
         means = params["pos"]
         opacities = torch.sigmoid(params["opacity_raw"]).squeeze(-1)
         scales = torch.exp(params["scale_raw"])
+        max_scale = float(self.config.get("max_scale", 0.03))
+        scales = torch.clamp(scales, min=1e-4, max=max_scale)
+
         quats = params["rotation"]
         colors = params["color"]
         semantics = params["semantics"]
@@ -528,27 +627,15 @@ class GaussianTrainer:
         H = int(height_override) if height_override is not None else int(camera.image_height)
 
         renders, alphas, info = gsplat.rasterization(
-            means=means,
-            quats=quats,
-            scales=scales,
-            opacities=opacities,
-            colors=features,
-            viewmats=viewmat.unsqueeze(0),
-            Ks=K[None],
-            width=W,
-            height=H,
-            packed=bool(packed),
+            means=means, quats=quats, scales=scales, opacities=opacities, colors=features,
+            viewmats=viewmat.unsqueeze(0), Ks=K[None], width=W, height=H, packed=bool(packed),
         )
 
-        out = renders[0]  # [H,W,3+C]
+        out = renders[0]
         rgb = out[..., :3].permute(2, 0, 1).contiguous()
         sem = out[..., 3:].permute(2, 0, 1).contiguous()
         alpha = alphas[0].contiguous()
         return rgb, sem, alpha, info
-
-    # -------------------------------------------------------------------------
-    # Losses
-    # -------------------------------------------------------------------------
 
     def _semantic_weight(self, iteration: int) -> float:
         start = int(self.config.get("semantic_loss_start", 2000))
@@ -565,10 +652,6 @@ class GaussianTrainer:
         return lam_max * t
 
     def compute_semantic_loss(self, rendered_sem: torch.Tensor, gt_mask: torch.Tensor) -> torch.Tensor:
-        """
-        rendered_sem: [C,H,W] nonnegative (alpha-blended one-hot), not guaranteed to sum to 1
-        gt_mask: [H,W] int labels (may contain invalid indices)
-        """
         ignore = int(self.config.get("semantic_ignore_index", -1))
         C, H, W = rendered_sem.shape
 
@@ -578,7 +661,7 @@ class GaussianTrainer:
             return torch.zeros((), device=rendered_sem.device)
 
         probs = rendered_sem.clamp(min=0)
-        probs = probs / (probs.sum(dim=0, keepdim=True).clamp(min=1e-8))  # [C,H,W]
+        probs = probs / (probs.sum(dim=0, keepdim=True).clamp(min=1e-8))
 
         flat_probs = probs.permute(1, 2, 0).reshape(-1, C)
         flat_gt = gt_mask.reshape(-1)
@@ -588,9 +671,12 @@ class GaussianTrainer:
         loss = F.nll_loss(logp, flat_gt, ignore_index=ignore, reduction="mean")
         return loss
 
-    # -------------------------------------------------------------------------
-    # Densification helpers
-    # -------------------------------------------------------------------------
+    def compute_offset_leash_loss(self) -> torch.Tensor:
+        off = self.model.anchor_offsets
+        scl = self.model.anchor_scalings.view(-1, 1, 1)
+        world_off = off * scl
+        leash_loss = (world_off.norm(dim=-1) ** 2).mean()
+        return leash_loss
 
     @staticmethod
     def _extract_visibility_mask(info: Dict, n_gaussians: int, device) -> torch.Tensor:
@@ -601,10 +687,6 @@ class GaussianTrainer:
                     if vis.numel() == n_gaussians:
                         return vis.reshape(-1).bool()
         return torch.ones((n_gaussians,), device=device, dtype=torch.bool)
-
-    # -------------------------------------------------------------------------
-    # Train step
-    # -------------------------------------------------------------------------
 
     def train_step(self, iteration: int) -> Dict:
         cam_idx = torch.randint(0, len(self.train_cameras), (1,), device=self.device).item()
@@ -622,27 +704,16 @@ class GaussianTrainer:
                 pass
 
         rendered_rgb, rendered_sem, alpha, info = self.render_with_semantics(
-            camera,
-            params,
-            K_override=K,
-            width_override=W,
-            height_override=H,
-            packed=True,
+            camera, params, K_override=K, width_override=W, height_override=H, packed=True,
         )
 
         l1 = F.l1_loss(rendered_rgb, gt_image)
-        ssim_val = ssim_func(
-            rendered_rgb.unsqueeze(0),
-            gt_image.unsqueeze(0),
-            data_range=1.0,
-            size_average=True,
-        )
+        ssim_val = ssim_func(rendered_rgb.unsqueeze(0), gt_image.unsqueeze(0), data_range=1.0, size_average=True)
         ssim_loss = 1.0 - ssim_val
 
         sc = torch.exp(params["scale_raw"])
         vol_loss = (sc.prod(dim=-1).mean() if sc.numel() > 0 else torch.zeros((), device=self.device))
-        
-        # Scale regularization with max_scale threshold
+
         max_scale = float(self.config.get("max_scale", 0.1))
         scale_reg = torch.relu(sc.max(dim=-1).values - max_scale).mean()
 
@@ -652,12 +723,19 @@ class GaussianTrainer:
         else:
             sem_loss = torch.zeros((), device=self.device)
 
+        leash_w = float(self.config.get("lambda_offset_leash", 0.0))
+        if leash_w > 0.0:
+            leash_loss = self.compute_offset_leash_loss()
+        else:
+            leash_loss = torch.zeros((), device=self.device)
+
         loss = (
             l1
             + float(self.config.get("lambda_ssim", 0.3)) * ssim_loss
             + float(self.config.get("lambda_volume", 0.0001)) * vol_loss
             + float(self.config.get("lambda_scale_reg", 1.0)) * scale_reg
             + float(sem_w) * sem_loss
+            + leash_w * leash_loss
         )
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -666,13 +744,20 @@ class GaussianTrainer:
         self.optimizer.step()
         self.scheduler.step()
 
-        # Gradient stats -> densify
+        n_clamped = self._apply_adaptive_offset_cap()
+
         if self.config.get("use_densification", True):
             pos = params.get("pos", None)
             if pos is not None and getattr(pos, "grad", None) is not None:
                 n_g = int(pos.shape[0])
                 vis = self._extract_visibility_mask(info, n_g, device=pos.device)
                 self.model.update_gradient_stats(pos.grad.detach(), vis)
+
+        with torch.no_grad():
+            world_off = self.model.anchor_offsets * self.model.anchor_scalings.view(-1, 1, 1)
+            offset_norms = world_off.norm(dim=-1)
+            offset_max = float(offset_norms.max().item())
+            offset_mean = float(offset_norms.mean().item())
 
         out = {
             "iter": int(iteration),
@@ -683,6 +768,11 @@ class GaussianTrainer:
             "scale_reg": float(scale_reg.item()),
             "semantic": float(sem_loss.item()) if sem_loss is not None else 0.0,
             "semantic_w": float(sem_w),
+            "leash": float(leash_loss.item()),
+            "leash_w": float(leash_w),
+            "offset_max": offset_max,
+            "offset_mean": offset_mean,
+            "offset_clamped": n_clamped,
             "train_res": f"{W}x{H}",
             "downscale": int(downscale),
             "has_mask": int(gt_mask is not None),
@@ -690,20 +780,8 @@ class GaussianTrainer:
         self.losses_history.append(out)
         return out
 
-    # -------------------------------------------------------------------------
-    # Evaluation
-    # -------------------------------------------------------------------------
-
     @torch.no_grad()
     def evaluate(self, iteration: int, save_preview: bool = True, preview_scale: float = 0.5, max_views: int = 5) -> Dict[str, float]:
-        """
-        Returns dict with:
-          test_l1, test_semantic (cached), overall
-
-        Semantic caching rule:
-          - if we see at least one masked view during this eval, recompute semantic mean over masked views
-          - otherwise keep previous semantic value
-        """
         self.model.eval()
 
         l1s: List[float] = []
@@ -721,182 +799,109 @@ class GaussianTrainer:
             params = self.model.get_parameters_as_tensors(camera_center=getattr(cam, "_campos_gpu", None))
             rgb, sem, alpha, info = self.render_with_semantics(cam, params, K_override=K, width_override=W, height_override=H, packed=False)
 
-            l1 = F.l1_loss(rgb, gt_image).item()
-            l1s.append(float(l1))
+            l1s.append(float(F.l1_loss(rgb, gt_image).item()))
 
-            if gt_mask is not None and self.config.get("use_semantic_loss", True):
-                sem_loss = self.compute_semantic_loss(sem, gt_mask).item()
-                sems.append(float(sem_loss))
+            if gt_mask is not None:
                 saw_mask = True
+                sem_loss = float(self.compute_semantic_loss(sem, gt_mask).item())
+                sems.append(sem_loss)
 
             if save_preview and vi == 0:
-                if preview_scale != 1.0:
-                    h2 = int(H * preview_scale)
-                    w2 = int(W * preview_scale)
-                    rgb_small = F.interpolate(rgb.unsqueeze(0), size=(h2, w2), mode="bilinear", align_corners=False)[0]
-                    gt_small = F.interpolate(gt_image.unsqueeze(0), size=(h2, w2), mode="bilinear", align_corners=False)[0]
-                else:
-                    rgb_small, gt_small = rgb, gt_image
+                preview_path = self.run_manager.progress_renders_dir / f"iter_{iteration:06d}.png"
+                _save_image_tensor(rgb, preview_path)
 
-                out = torch.cat([gt_small, rgb_small], dim=2).clamp(0, 1)
-                fn = f"iter_{iteration:06d}.png"
-                _save_image_tensor(out, self.run_manager.progress_renders_dir / fn)
+        mean_l1 = float(np.mean(l1s)) if l1s else 0.0
 
-        test_l1 = float(np.mean(l1s)) if l1s else float("inf")
-
-        if saw_mask and len(sems) > 0:
-            self.last_semantic_eval_loss = float(np.mean(sems))
-
-        sem_cached = float(self.last_semantic_eval_loss)
-        sem_w = self._semantic_weight(iteration)
-        overall = float(test_l1 + sem_w * sem_cached)
+        if saw_mask and sems:
+            mean_sem = float(np.mean(sems))
+            self.last_semantic_eval_loss = mean_sem
+        else:
+            mean_sem = self.last_semantic_eval_loss
 
         self.model.train()
-        return {"test_l1": test_l1, "test_semantic": sem_cached, "overall": overall}
 
-    # -------------------------------------------------------------------------
-    # Checkpointing
-    # -------------------------------------------------------------------------
+        return {"test_l1": mean_l1, "test_semantic": mean_sem, "overall": mean_l1 + 0.1 * mean_sem}
 
-    def _save_checkpoint_file(self, iteration: int, metric: float) -> Path:
-        path = self.run_manager.checkpoints_dir / f"checkpoint_{iteration:06d}.pth"
-
-        model_meta = None
-        if hasattr(self.model, "state_metadata"):
-            try:
-                model_meta = self.model.state_metadata()
-            except Exception:
-                model_meta = None
-
-        torch.save(
-            {
-                "iteration": int(iteration),
-                "metric": float(metric),
-                "metric_name": str(self.config.get("checkpoint_metric", "test_l1")),
-                "model_state_dict": self.model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "scheduler_state_dict": self.scheduler.state_dict(),
-                "config": dict(self.config),
-                "scene_name": self.run_manager.scene_name,
-                "run_name": self.run_manager.run_name,
-                "num_objects": int(getattr(self.model, "num_objects", -1)),
-                "object_names": getattr(self.model, "object_names", None),
-                "model_meta": model_meta,
-            },
-            path,
-        )
-        return path
-
-    def load_checkpoint(self, ckpt_path: Union[str, Path], load_optimizer: bool = True) -> Dict:
-        ckpt_path = Path(ckpt_path)
-        ckpt = torch.load(ckpt_path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model_state_dict"], strict=False)
-
-        if load_optimizer and "optimizer_state_dict" in ckpt:
-            try:
-                self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            except Exception:
-                self.logger.warning("Could not load optimizer state, rebuilding optimizer")
-                self._rebuild_optimizer_after_densify()
-                
-        if load_optimizer and "scheduler_state_dict" in ckpt:
-            try:
-                self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-            except Exception:
-                self.logger.warning("Could not load scheduler state")
-
-        self.current_iteration = int(ckpt.get("iteration", 0))
-        return ckpt
-
-    def maybe_save_topk_checkpoint(self, iteration: int, metrics: Dict[str, float]) -> Optional[Path]:
+    def maybe_save_topk_checkpoint(self, iteration: int, eval_metrics: Dict[str, float]) -> Optional[Path]:
         metric_name = str(self.config.get("checkpoint_metric", "test_l1"))
-        metric_val = float(metrics.get(metric_name, metrics.get("test_l1", float("inf"))))
-        ckpt_path = self._save_checkpoint_file(iteration, metric_val)
+        metric_val = float(eval_metrics.get(metric_name, eval_metrics["test_l1"]))
+
+        ckpt_path = self.run_manager.checkpoints_dir / f"ckpt_iter_{iteration:06d}.pt"
+
+        ckpt = {
+            "iteration": int(iteration),
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "config": self.config,
+            "eval_metrics": eval_metrics,
+            "model_meta": self.model.state_metadata() if hasattr(self.model, "state_metadata") else {},
+        }
+        torch.save(ckpt, ckpt_path)
+
         self.ckpt_mgr.consider(metric_val, iteration, ckpt_path)
         return ckpt_path
 
-    # -------------------------------------------------------------------------
-    # Marble export (ONLY export path kept)
-    # -------------------------------------------------------------------------
-
-    def save_splat_ply_marble(
-        self,
-        save_path: Optional[Path] = None,
-        iteration: Optional[int] = None,
-        include_f_rest: bool = False,
-        include_instance_id: bool = True,
-        params_override: Optional[Dict[str, torch.Tensor]] = None,
-        model_override=None,
-    ) -> Path:
-        """
-        Marble/Spark-friendly 3DGS PLY:
-          - binary_little_endian
-          - opacity is LOGIT (no sigmoid)
-          - scale_0..2 are LOG-SCALES (no exp)
-          - color stored as f_dc_0..2 (SH DC), not RGB
-          - optional f_rest_0..44 (zeros)
-          - optional instance_id appended at end
-        """
+    def save_splat_ply_marble(self, save_path: Optional[Union[str, Path]] = None, iteration: Optional[int] = None,
+                              include_f_rest: bool = False, include_instance_id: bool = False,
+                              params_override: Optional[Dict] = None, model_override=None) -> Path:
         import struct
 
         if iteration is None:
-            iteration = self.current_iteration
+            iteration = int(self.current_iteration)
 
         if save_path is None:
-            save_path = self.run_manager.final_outputs_dir / f"splats_marble_{int(iteration):06d}.ply"
+            save_path = self.run_manager.final_outputs_dir / f"marble_iter_{iteration:06d}.ply"
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with torch.no_grad():
-            if params_override is not None:
-                params = params_override
-            else:
-                src = model_override if model_override is not None else self.model
-                params = src.get_parameters_as_tensors()
+        src_model = model_override if model_override is not None else self.model
+        if params_override is not None:
+            params = params_override
+        else:
+            params = src_model.get_parameters_as_tensors()
 
-            pos = params["pos"].detach().cpu().numpy().astype(np.float32)
-            rgb = params["color"].detach().cpu().numpy().astype(np.float32)
-            op_raw = params["opacity_raw"].detach().cpu().numpy().astype(np.float32).reshape(-1)
-            scl_raw = params["scale_raw"].detach().cpu().numpy().astype(np.float32)
-            quat = params["rotation"].detach().cpu().numpy().astype(np.float32)
+        pos = params["pos"].detach().cpu()
+        op_raw = params["opacity_raw"].detach().cpu().squeeze(-1)
+        scl_raw = params["scale_raw"].detach().cpu()
+        quat = params["rotation"].detach().cpu()
+        color = params["color"].detach().cpu()
 
-            qn = np.linalg.norm(quat, axis=1, keepdims=True) + 1e-12
-            quat = quat / qn
+        instance_id = None
+        if include_instance_id and "object_ids" in params:
+            instance_id = params["object_ids"].detach().cpu().int()
 
-            SH_C0 = 0.28209479177387814
-            f_dc = (rgb - 0.5) / SH_C0
+        N = int(pos.shape[0])
 
-            N = pos.shape[0]
-
-            instance_id = None
-            if include_instance_id and "object_ids" in params:
-                instance_id = params["object_ids"].detach().cpu().numpy().astype(np.int32)
-
-        props = [
-            ("float", "x"), ("float", "y"), ("float", "z"),
-            ("float", "f_dc_0"), ("float", "f_dc_1"), ("float", "f_dc_2"),
-            ("float", "opacity"),
-            ("float", "scale_0"), ("float", "scale_1"), ("float", "scale_2"),
-            ("float", "rot_0"), ("float", "rot_1"), ("float", "rot_2"), ("float", "rot_3"),
+        header_lines = [
+            "ply", "format binary_little_endian 1.0", f"element vertex {N}",
+            "property float x", "property float y", "property float z",
+            "property float f_dc_0", "property float f_dc_1", "property float f_dc_2",
+            "property float opacity",
+            "property float scale_0", "property float scale_1", "property float scale_2",
+            "property float rot_0", "property float rot_1", "property float rot_2", "property float rot_3",
         ]
+
         if include_f_rest:
             for i in range(45):
-                props.append(("float", f"f_rest_{i}"))
-        if instance_id is not None:
-            props.append(("int", "instance_id"))
+                header_lines.append(f"property float f_rest_{i}")
 
-        header = ["ply", "format binary_little_endian 1.0", f"element vertex {N}"]
-        header += [f"property {t} {n}" for t, n in props]
-        header.append("end_header\n")
-        header_bytes = ("\n".join(header)).encode("ascii")
+        if include_instance_id and instance_id is not None:
+            header_lines.append("property int instance_id")
+
+        header_lines.append("end_header")
+        header = "\n".join(header_lines) + "\n"
 
         with open(save_path, "wb") as f:
-            f.write(header_bytes)
+            f.write(header.encode("utf-8"))
             for i in range(N):
+                c0 = (float(color[i, 0]) - 0.5) / 0.2821
+                c1 = (float(color[i, 1]) - 0.5) / 0.2821
+                c2 = (float(color[i, 2]) - 0.5) / 0.2821
+
                 row = [
                     float(pos[i, 0]), float(pos[i, 1]), float(pos[i, 2]),
-                    float(f_dc[i, 0]), float(f_dc[i, 1]), float(f_dc[i, 2]),
-                    float(op_raw[i]),
+                    c0, c1, c2, float(op_raw[i]),
                     float(scl_raw[i, 0]), float(scl_raw[i, 1]), float(scl_raw[i, 2]),
                     float(quat[i, 0]), float(quat[i, 1]), float(quat[i, 2]), float(quat[i, 3]),
                 ]
@@ -909,10 +914,6 @@ class GaussianTrainer:
 
         self.logger.info(f"[EXPORT] Marble PLY saved: {save_path}")
         return save_path
-
-    # -------------------------------------------------------------------------
-    # Training loop
-    # -------------------------------------------------------------------------
 
     def train(self) -> Dict[str, Path]:
         self.logger.info("=" * 70)
@@ -932,37 +933,50 @@ class GaussianTrainer:
         for i in pbar:
             self.current_iteration = i
 
-            # Densification (only up to densify_until)
             if (
                 self.config.get("use_densification", True)
                 and i >= int(self.config.get("densify_start", 1000))
                 and i <= densify_until
                 and i % int(self.config.get("densify_interval", 1000)) == 0
             ):
+                old_optimizer = self.optimizer
+                old_scheduler = self.scheduler
+                old_anchor_params = {
+                    "anchor_features": self.model.anchor_features,
+                    "anchor_scalings": self.model.anchor_scalings,
+                    "anchor_offsets": self.model.anchor_offsets,
+                }
                 stats = self.model.densify_and_prune(
+                    iteration=i,
                     grad_threshold=float(self.config.get("densify_grad_threshold", 5e-5)),
-                    min_opacity=float(self.config.get("prune_opacity_threshold", 0.01)),
+                    min_opacity=float(self.config.get("prune_opacity_threshold", 0.02)),
+                    prune_warmup_iters=int(self.config.get("prune_warmup_iters", 0)),
+                    prune_grad_factor=float(self.config.get("prune_grad_factor", 0.25)),
+                    min_cycles=int(self.config.get("min_cycles", 5)),
                 )
-                self.model.reset_gradient_stats()
                 self.logger.info(f"[DENSIFY/PRUNE] iter={i} stats={stats}")
+
+                self._rebuild_optimizer_after_densify_preserve_state(
+                    old_optimizer=old_optimizer, old_scheduler=old_scheduler,
+                    old_anchor_params=old_anchor_params, mapping=stats,
+                )
                 
-                # Rebuild optimizer after densification changes parameter shapes
-                self._rebuild_optimizer_after_densify()
+                if float(self.config.get("adaptive_offset_cap_multiplier", 0.0)) > 0.0:
+                    self._compute_anchor_nn_distances(force=True)
 
             losses = self.train_step(i)
-            
-            # Progress bar description
+
             desc = f"iter {i} | loss {losses['loss']:.4f} | L1 {losses['l1']:.4f}"
+            if losses['leash_w'] > 0:
+                desc += f" | leash {losses['leash']:.4f}"
+            if losses['offset_clamped'] > 0:
+                desc += f" | clamped {losses['offset_clamped']}"
             if losses['downscale'] > 1:
                 desc += f" | ds {losses['downscale']}"
             pbar.set_description(desc)
 
             if (i % eval_interval) == 0:
-                eval_metrics = self.evaluate(
-                    i,
-                    save_preview=True,
-                    preview_scale=float(self.config.get("progress_render_scale", 0.5)),
-                )
+                eval_metrics = self.evaluate(i, save_preview=True, preview_scale=float(self.config.get("progress_render_scale", 0.5)))
                 self.maybe_save_topk_checkpoint(i, eval_metrics)
                 best_rec = self.ckpt_mgr.get_best()
                 best_ckpt_path = best_rec.path if best_rec is not None else best_ckpt_path
@@ -977,13 +991,16 @@ class GaussianTrainer:
                 else:
                     no_improve_evals += 1
 
-                # Log with semantic info if applicable
                 sem_str = ""
                 if eval_metrics['test_semantic'] > 0:
                     sem_str = f" Sem={eval_metrics['test_semantic']:.4f}"
-                
+
+                offset_str = f" offset_max={losses['offset_max']:.4f}m offset_mean={losses['offset_mean']:.4f}m"
+                if losses['offset_clamped'] > 0:
+                    offset_str += f" clamped={losses['offset_clamped']}"
+
                 self.logger.info(
-                    f"[EVAL] iter={i} L1={eval_metrics['test_l1']:.4f}{sem_str} "
+                    f"[EVAL] iter={i} L1={eval_metrics['test_l1']:.4f}{sem_str}{offset_str} "
                     f"| best={best_metric:.4f} | no_improve={no_improve_evals}"
                 )
 
@@ -1012,16 +1029,7 @@ class GaussianTrainer:
         self.logger.info(f"All outputs saved to: {self.run_manager.run_dir}")
         return exports
 
-    # -------------------------------------------------------------------------
-    # Export best checkpoint (Marble ONLY)
-    # -------------------------------------------------------------------------
-
     def export_best_marble(self, best_ckpt_path: Optional[Union[str, Path]]) -> Dict[str, Path]:
-        """
-        CRITICAL FIX:
-        - NEVER load the best checkpoint into self.model (topology mismatch after densify/prune).
-        - Instead: load checkpoint -> rebuild a FRESH model instance -> export from that.
-        """
         self.logger.info("=" * 70)
         self.logger.info("EXPORTING BEST (MARBLE ONLY)")
         self.logger.info("=" * 70)
@@ -1029,13 +1037,12 @@ class GaussianTrainer:
         exports: Dict[str, Path] = {}
         best_iter = int(self.current_iteration)
 
-        export_model = self.model  # fallback
+        export_model = self.model
         if best_ckpt_path is not None and Path(best_ckpt_path).exists():
             ckpt = torch.load(Path(best_ckpt_path), map_location=self.device)
             best_iter = int(ckpt.get("iteration", best_iter))
 
             try:
-                # Requires ObjectGSModel.from_checkpoint()
                 export_model, _ = self.model.__class__.from_checkpoint(ckpt, device=self.device)
             except Exception as e:
                 self.logger.exception(f"[EXPORT] Failed to rebuild model from ckpt; exporting current model. err={e}")
@@ -1045,12 +1052,7 @@ class GaussianTrainer:
         else:
             self.logger.warning("[EXPORT] No best checkpoint found; exporting current model state.")
 
-        scene_ply = self.save_splat_ply_marble(
-            iteration=best_iter,
-            include_f_rest=False,
-            include_instance_id=False,
-            model_override=export_model,
-        )
+        scene_ply = self.save_splat_ply_marble(iteration=best_iter, include_f_rest=False, include_instance_id=False, model_override=export_model)
         exports["marble_scene_ply"] = scene_ply
 
         obj_dir = self.run_manager.final_outputs_dir / "marble_objects"
@@ -1066,12 +1068,7 @@ class GaussianTrainer:
             name = object_names[obj_id] if obj_id < len(object_names) else f"object_{obj_id}"
             safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
             out_path = obj_dir / f"{obj_id:03d}_{safe}.ply"
-            self.save_splat_ply_marble(
-                save_path=out_path,
-                iteration=best_iter,
-                include_instance_id=False,
-                params_override=params_obj,
-            )
+            self.save_splat_ply_marble(save_path=out_path, iteration=best_iter, include_instance_id=False, params_override=params_obj)
 
         exports["marble_objects_dir"] = obj_dir
         return exports

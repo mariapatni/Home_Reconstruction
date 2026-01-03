@@ -13,6 +13,14 @@ Key fixes:
 Trainer expects model.get_parameters_as_tensors() returns:
   pos, opacity_raw, scale_raw, rotation, color, object_ids, semantics
 semantics is ONE-HOT [N_gauss, num_objects]
+
+NEW in this revision:
+- Proper "min_cycles" semantics: low-gradient streak counted in *densify cycles*, not iterations.
+- Removes any accidental double-resets by making resets explicit: accum/count reset per cycle, streak persists.
+- Remaps anchor_lowgrad_streak correctly across prune/grow.
+- Adds checkpoint rebuild support for anchor_lowgrad_streak.
+- Adds optional hard reset of streak via reset_gradient_stats(reset_streak=True).
+- Streak update only considers anchors visible at least once in the last cycle (optional safety behavior).
 """
 
 from __future__ import annotations
@@ -118,7 +126,11 @@ class ViewDependentAttributeMLP(nn.Module):
         if view_dirs is not None and view_dists is not None:
             view_info = torch.cat([view_dists, view_dirs], dim=-1)  # [N,4]
         else:
-            view_info = torch.zeros((N, self.view_dim), device=anchor_features.device, dtype=anchor_features.dtype)
+            view_info = torch.zeros(
+                (N, self.view_dim),
+                device=anchor_features.device,
+                dtype=anchor_features.dtype,
+            )
 
         col_in = torch.cat([anchor_features, view_info], dim=-1)
         color_delta = self.color_mlp(col_in).view(N, self.k, 3)
@@ -154,14 +166,20 @@ class ObjectGSModel(nn.Module):
             if object_ids is None:
                 self.num_objects = 1
             else:
-                oid_np = object_ids.detach().cpu().numpy() if isinstance(object_ids, torch.Tensor) else np.asarray(object_ids)
+                oid_np = (
+                    object_ids.detach().cpu().numpy()
+                    if isinstance(object_ids, torch.Tensor)
+                    else np.asarray(object_ids)
+                )
                 self.num_objects = int(oid_np.max()) + 1 if oid_np.size > 0 else 1
 
         if object_names is None:
             object_names = [f"object_{i}" for i in range(self.num_objects)]
         else:
             if len(object_names) < self.num_objects:
-                object_names = list(object_names) + [f"object_{i}" for i in range(len(object_names), self.num_objects)]
+                object_names = list(object_names) + [
+                    f"object_{i}" for i in range(len(object_names), self.num_objects)
+                ]
         if len(object_names) > 0:
             object_names = list(object_names)
             object_names[0] = "background"
@@ -175,14 +193,26 @@ class ObjectGSModel(nn.Module):
             if self.logger:
                 self.logger.info("Initialized placeholder anchors (checkpoint reconstruction mode).")
         else:
-            pc = point_cloud.detach().cpu().numpy() if isinstance(point_cloud, torch.Tensor) else np.asarray(point_cloud)
-            col = colors.detach().cpu().numpy() if isinstance(colors, torch.Tensor) else np.asarray(colors)
+            pc = (
+                point_cloud.detach().cpu().numpy()
+                if isinstance(point_cloud, torch.Tensor)
+                else np.asarray(point_cloud)
+            )
+            col = (
+                colors.detach().cpu().numpy()
+                if isinstance(colors, torch.Tensor)
+                else np.asarray(colors)
+            )
 
             if object_ids is None:
                 object_ids = np.zeros(len(pc), dtype=np.int32)
                 if self.logger:
                     self.logger.warning("No object_ids provided; using all zeros (background).")
-            oid = object_ids.detach().cpu().numpy() if isinstance(object_ids, torch.Tensor) else np.asarray(object_ids)
+            oid = (
+                object_ids.detach().cpu().numpy()
+                if isinstance(object_ids, torch.Tensor)
+                else np.asarray(object_ids)
+            )
             oid = oid.astype(np.int32)
             if num_objects_override is not None and self.num_objects > 0:
                 oid = np.clip(oid, 0, self.num_objects - 1)
@@ -190,7 +220,9 @@ class ObjectGSModel(nn.Module):
             if self.logger:
                 self._log_init(pc, oid)
 
-            anchor_positions, anchor_colors, anchor_object_ids = self._voxelize_instance_aware(pc, col, oid)
+            anchor_positions, anchor_colors, anchor_object_ids = self._voxelize_instance_aware(
+                pc, col, oid
+            )
 
         num_anchors = int(anchor_positions.shape[0])
 
@@ -200,20 +232,47 @@ class ObjectGSModel(nn.Module):
             self.logger.info("=" * 70)
 
         # Fixed anchor positions (offsets learnable)
-        self.anchor_positions = nn.Parameter(torch.tensor(anchor_positions, dtype=torch.float32), requires_grad=False)
+        self.anchor_positions = nn.Parameter(
+            torch.tensor(anchor_positions, dtype=torch.float32),
+            requires_grad=False,
+        )
 
         # Buffers that can change on densify/prune MUST remain buffers
-        self.register_buffer("anchor_colors", torch.tensor(anchor_colors, dtype=torch.float32), persistent=True)
-        self.register_buffer("anchor_object_ids", torch.tensor(anchor_object_ids, dtype=torch.long), persistent=True)
+        self.register_buffer(
+            "anchor_colors",
+            torch.tensor(anchor_colors, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "anchor_object_ids",
+            torch.tensor(anchor_object_ids, dtype=torch.long),
+            persistent=True,
+        )
 
         # Learnables
         self.anchor_features = nn.Parameter(self._init_features(anchor_colors, num_anchors))
         self.anchor_scalings = nn.Parameter(torch.ones(num_anchors, dtype=torch.float32))
-        self.anchor_offsets = nn.Parameter(torch.randn(num_anchors, self.k, 3, dtype=torch.float32) * 0.01)
+        self.anchor_offsets = nn.Parameter(
+            torch.randn(num_anchors, self.k, 3, dtype=torch.float32) * 0.01
+        )
 
         # Densification stats buffers
-        self.register_buffer("anchor_gradient_accum", torch.zeros(num_anchors, dtype=torch.float32), persistent=True)
-        self.register_buffer("anchor_gradient_count", torch.zeros(num_anchors, dtype=torch.int32), persistent=True)
+        self.register_buffer(
+            "anchor_gradient_accum",
+            torch.zeros(num_anchors, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "anchor_gradient_count",
+            torch.zeros(num_anchors, dtype=torch.int32),
+            persistent=True,
+        )
+        # NEW: per-anchor low-gradient streak counted in *densify cycles*
+        self.register_buffer(
+            "anchor_lowgrad_streak",
+            torch.zeros(num_anchors, dtype=torch.int32),
+            persistent=True,
+        )
 
         self.attribute_mlp = ViewDependentAttributeMLP(
             feature_dim=self.feature_dim,
@@ -386,11 +445,15 @@ class ObjectGSModel(nn.Module):
             view_dirs, view_dists = None, None
 
         # positions [N_anchor,k,3] -> [N_g,3]
-        pos = self.anchor_positions.unsqueeze(1) + self.anchor_offsets * self.anchor_scalings.unsqueeze(1).unsqueeze(2)
+        pos = self.anchor_positions.unsqueeze(1) + (
+            self.anchor_offsets * self.anchor_scalings.unsqueeze(1).unsqueeze(2)
+        )
         pos = pos.reshape(-1, 3)
 
         # MLP outputs at anchor-level
-        opacity_raw, scale_raw, rotation, color_delta = self.attribute_mlp(self.anchor_features, view_dirs, view_dists)
+        opacity_raw, scale_raw, rotation, color_delta = self.attribute_mlp(
+            self.anchor_features, view_dirs, view_dists
+        )
 
         # flatten to gaussian-level
         opacity_raw = opacity_raw.reshape(-1, 1)
@@ -463,54 +526,129 @@ class ObjectGSModel(nn.Module):
         self.anchor_gradient_accum[anchor_visible] += anchor_grads[anchor_visible]
         self.anchor_gradient_count[anchor_visible] += 1
 
-    def reset_gradient_stats(self):
+    def reset_gradient_stats(self, reset_streak: bool = False):
+        """
+        Reset cycle accumulators. By default we do NOT reset streak because streak is meant
+        to accumulate across densify cycles. Use reset_streak=True for a full hard reset.
+        """
         self.anchor_gradient_accum.zero_()
         self.anchor_gradient_count.zero_()
+        if reset_streak:
+            self.anchor_lowgrad_streak.zero_()
 
     @torch.no_grad()
-    def densify_and_prune(self, grad_threshold: float = 5e-5, min_opacity: float = 0.01) -> Dict:
+    def densify_and_prune(
+        self,
+        iteration: int,
+        grad_threshold: float = 5e-5,
+        min_opacity: float = 0.01,
+        prune_warmup_iters: int = 0,
+        prune_grad_factor: float = 0.25,
+        min_cycles: int = 5,  # number of *densify cycles* of sustained low-grad
+    ) -> Dict:
         """
         Densify and prune anchors based on gradient statistics and opacity.
-        
-        Returns stats dict with anchors_before, pruned, grown, anchors_after.
-        """
-        stats = {"anchors_before": int(self._num_anchors), "pruned": 0, "grown": 0}
 
+        Behavior:
+        - Growth allowed at all times
+        - Pruning disabled until iteration >= prune_warmup_iters
+        - Pruning only if:
+            (low opacity) AND (low gradient sustained for min_cycles densify cycles)
+
+        Streak update behavior:
+        - Only anchors visible at least once in the last cycle contribute to (reset/increment) streak.
+          Anchors never visible keep their current streak (no change).
+        """
+        stats: Dict = {
+            "anchors_before": int(self._num_anchors),
+            "pruned": 0,
+            "grown": 0,
+        }
+
+        # ------------------------------------------------------------
+        # Compute opacity
+        # ------------------------------------------------------------
         opacity_raw, _, _, _ = self.attribute_mlp(self.anchor_features, None, None)
         anchor_op = torch.sigmoid(opacity_raw).mean(dim=1)  # [N_anchor]
 
-        # Average gradients over accumulated counts
+        # ------------------------------------------------------------
+        # Gradient statistics for *last densify cycle*
+        # ------------------------------------------------------------
+        visible_this_cycle = self.anchor_gradient_count > 0
         counts = self.anchor_gradient_count.clamp(min=1).float()
         avg_grads = self.anchor_gradient_accum / counts
 
-        # Prune low opacity anchors
-        prune_mask = anchor_op < float(min_opacity)
-        stats["pruned"] = int(prune_mask.sum().item())
+        # ------------------------------------------------------------
+        # Growth rule (unchanged)
+        # ------------------------------------------------------------
+        grow_mask = avg_grads > float(grad_threshold)
 
-        # Grow high gradient anchors (that aren't being pruned)
-        grow_mask = (avg_grads > float(grad_threshold)) & (~prune_mask)
+        # ------------------------------------------------------------
+        # Update low-gradient streak ONCE per densify cycle
+        # Only update streak for anchors visible in this cycle.
+        # ------------------------------------------------------------
+        low_grad_now = visible_this_cycle & (
+            avg_grads < (float(grad_threshold) * float(prune_grad_factor))
+        )
+
+        # If visible and low-grad -> streak+1
+        # If visible and NOT low-grad -> streak=0
+        # If NOT visible -> streak unchanged
+        inc = self.anchor_lowgrad_streak + 1
+        zero = torch.zeros_like(self.anchor_lowgrad_streak)
+        self.anchor_lowgrad_streak = torch.where(
+            low_grad_now,
+            inc,
+            torch.where(visible_this_cycle, zero, self.anchor_lowgrad_streak),
+        )
+
+        # ------------------------------------------------------------
+        # Pruning rule: sustained low-grad for min_cycles + low opacity
+        # ------------------------------------------------------------
+        low_opacity = anchor_op < float(min_opacity)
+        prune_mask = (self.anchor_lowgrad_streak >= int(min_cycles)) & low_opacity
+
+        # Warmup override: disable pruning early (streak may still accumulate)
+        if int(iteration) < int(prune_warmup_iters):
+            prune_mask = torch.zeros_like(prune_mask, dtype=torch.bool)
+
+        # Never grow anchors we are pruning
+        grow_mask = grow_mask & (~prune_mask)
+
+        # ------------------------------------------------------------
+        # Apply densification
+        # ------------------------------------------------------------
+        stats["pruned"] = int(prune_mask.sum().item())
         stats["grown"] = int(grow_mask.sum().item())
 
         if stats["pruned"] > 0 or stats["grown"] > 0:
-            self._apply_densification(prune_mask, grow_mask)
+            mapping = self._apply_densification(prune_mask, grow_mask)
+            stats.update(mapping)
 
-        self.reset_gradient_stats()
+        # IMPORTANT: reset cycle accumulators (but NOT the streak)
+        self.anchor_gradient_accum.zero_()
+        self.anchor_gradient_count.zero_()
+
         stats["anchors_after"] = int(self._num_anchors)
         return stats
 
     @torch.no_grad()
-    def _apply_densification(self, prune_mask: torch.Tensor, grow_mask: torch.Tensor):
+    def _apply_densification(self, prune_mask: torch.Tensor, grow_mask: torch.Tensor) -> Dict:
         device = self.anchor_positions.device
         keep_mask = ~prune_mask
 
-        grow_indices = torch.where(grow_mask & keep_mask)[0]
-        n_keep = int(keep_mask.sum().item())
-        n_grow = int(grow_indices.numel())
+        keep_indices_old = torch.where(keep_mask)[0]
+        grow_indices_old = torch.where(grow_mask & keep_mask)[0]
+
+        n_keep = int(keep_indices_old.numel())
+        n_grow = int(grow_indices_old.numel())
         new_n = n_keep + n_grow
         if new_n <= 0:
-            return
+            return {"keep_indices_old": keep_indices_old, "grow_parent_old": grow_indices_old}
 
-        # kept
+        # --------------------------------------------------
+        # Kept anchors
+        # --------------------------------------------------
         new_pos = self.anchor_positions.data[keep_mask]
         new_col = self.anchor_colors[keep_mask]
         new_oid = self.anchor_object_ids[keep_mask]
@@ -518,20 +656,32 @@ class ObjectGSModel(nn.Module):
         new_scl = self.anchor_scalings.data[keep_mask]
         new_off = self.anchor_offsets.data[keep_mask]
 
-        # grown (inherit instance id)
-        if n_grow > 0:
-            kept_indices = torch.where(keep_mask)[0]
-            mapping = {int(kept_indices[i].item()): i for i in range(kept_indices.numel())}
-            grow_in_kept = [mapping[int(g.item())] for g in grow_indices if int(g.item()) in mapping]
-            if len(grow_in_kept) > 0:
-                grow_in_kept = torch.tensor(grow_in_kept, device=device, dtype=torch.long)
+        # Preserve gradient history for kept anchors
+        new_grad_accum = self.anchor_gradient_accum[keep_mask]
+        new_grad_count = self.anchor_gradient_count[keep_mask]
+        # Preserve streak for kept anchors (force int32 for safety)
+        new_streak = self.anchor_lowgrad_streak[keep_mask].to(dtype=torch.int32)
 
-                gpos = new_pos[grow_in_kept] + torch.randn(len(grow_in_kept), 3, device=device) * self.voxel_size * 0.1
+        # --------------------------------------------------
+        # Grown children
+        # --------------------------------------------------
+        if n_grow > 0:
+            mapping = {int(keep_indices_old[i]): i for i in range(n_keep)}
+            grow_in_kept = torch.tensor(
+                [mapping[int(g)] for g in grow_indices_old if int(g) in mapping],
+                device=device,
+                dtype=torch.long,
+            )
+
+            if grow_in_kept.numel() > 0:
+                child_scale = 0.6
+
+                gpos = new_pos[grow_in_kept] + torch.randn_like(new_pos[grow_in_kept]) * self.voxel_size * 0.1
                 gcol = new_col[grow_in_kept]
                 goid = new_oid[grow_in_kept]
-                gfeat = new_feat[grow_in_kept] + torch.randn(len(grow_in_kept), self.feature_dim, device=device) * 0.01
-                gscl = new_scl[grow_in_kept]
-                goff = new_off[grow_in_kept] + torch.randn(len(grow_in_kept), self.k, 3, device=device) * 0.001
+                gfeat = new_feat[grow_in_kept] + torch.randn_like(new_feat[grow_in_kept]) * 0.01
+                gscl = new_scl[grow_in_kept] * child_scale
+                goff = new_off[grow_in_kept] + torch.randn_like(new_off[grow_in_kept]) * 0.0005
 
                 new_pos = torch.cat([new_pos, gpos], dim=0)
                 new_col = torch.cat([new_col, gcol], dim=0)
@@ -540,20 +690,41 @@ class ObjectGSModel(nn.Module):
                 new_scl = torch.cat([new_scl, gscl], dim=0)
                 new_off = torch.cat([new_off, goff], dim=0)
 
-        # reassign parameters
+                # children start with ZERO history / ZERO streak
+                new_grad_accum = torch.cat(
+                    [new_grad_accum, torch.zeros(len(grow_in_kept), device=device, dtype=new_grad_accum.dtype)],
+                    dim=0,
+                )
+                new_grad_count = torch.cat(
+                    [new_grad_count, torch.zeros(len(grow_in_kept), device=device, dtype=torch.int32)],
+                    dim=0,
+                )
+                new_streak = torch.cat(
+                    [new_streak, torch.zeros(len(grow_in_kept), device=device, dtype=torch.int32)],
+                    dim=0,
+                )
+
+        # --------------------------------------------------
+        # Reassign tensors
+        # --------------------------------------------------
         self.anchor_positions = nn.Parameter(new_pos, requires_grad=False)
         self.anchor_features = nn.Parameter(new_feat)
         self.anchor_scalings = nn.Parameter(new_scl)
         self.anchor_offsets = nn.Parameter(new_off)
 
-        # CRITICAL: preserve buffers as buffers
         self._buffers["anchor_colors"] = new_col
         self._buffers["anchor_object_ids"] = new_oid
-        self._buffers["anchor_gradient_accum"] = torch.zeros(new_n, device=device, dtype=torch.float32)
-        self._buffers["anchor_gradient_count"] = torch.zeros(new_n, device=device, dtype=torch.int32)
+        self._buffers["anchor_gradient_accum"] = new_grad_accum
+        self._buffers["anchor_gradient_count"] = new_grad_count
+        self._buffers["anchor_lowgrad_streak"] = new_streak
 
         self._num_anchors = int(new_n)
         self._num_gaussians = int(new_n * self.k)
+
+        return {
+            "keep_indices_old": keep_indices_old.detach().cpu(),
+            "grow_parent_old": grow_indices_old.detach().cpu(),
+        }
 
     # ---------------------------------------------------------------------
     # Checkpoint compatibility (variable anchor counts)
@@ -593,35 +764,66 @@ class ObjectGSModel(nn.Module):
 
         ap = state_dict.get("anchor_positions", None)
         ap_shape = tuple(ap.shape) if ap is not None else (N, 3)
-        self.anchor_positions = nn.Parameter(torch.empty(ap_shape, device=device, dtype=dt("anchor_positions", torch.float32)), requires_grad=False)
+        self.anchor_positions = nn.Parameter(
+            torch.empty(ap_shape, device=device, dtype=dt("anchor_positions", torch.float32)),
+            requires_grad=False,
+        )
 
         af = state_dict.get("anchor_features", None)
         af_shape = tuple(af.shape) if af is not None else (N, self.feature_dim)
-        self.anchor_features = nn.Parameter(torch.empty(af_shape, device=device, dtype=dt("anchor_features", torch.float32)), requires_grad=True)
+        self.anchor_features = nn.Parameter(
+            torch.empty(af_shape, device=device, dtype=dt("anchor_features", torch.float32)),
+            requires_grad=True,
+        )
 
         asc = state_dict.get("anchor_scalings", None)
         asc_shape = tuple(asc.shape) if asc is not None else (N,)
-        self.anchor_scalings = nn.Parameter(torch.empty(asc_shape, device=device, dtype=dt("anchor_scalings", torch.float32)), requires_grad=True)
+        self.anchor_scalings = nn.Parameter(
+            torch.empty(asc_shape, device=device, dtype=dt("anchor_scalings", torch.float32)),
+            requires_grad=True,
+        )
 
         ao = state_dict.get("anchor_offsets", None)
         ao_shape = tuple(ao.shape) if ao is not None else (N, self.k, 3)
-        self.anchor_offsets = nn.Parameter(torch.empty(ao_shape, device=device, dtype=dt("anchor_offsets", torch.float32)), requires_grad=True)
+        self.anchor_offsets = nn.Parameter(
+            torch.empty(ao_shape, device=device, dtype=dt("anchor_offsets", torch.float32)),
+            requires_grad=True,
+        )
 
         ac = state_dict.get("anchor_colors", None)
         ac_shape = tuple(ac.shape) if ac is not None else (N, 3)
-        self._buffer_assign("anchor_colors", torch.empty(ac_shape, device=device, dtype=dt("anchor_colors", torch.float32)))
+        self._buffer_assign(
+            "anchor_colors",
+            torch.empty(ac_shape, device=device, dtype=dt("anchor_colors", torch.float32)),
+        )
 
         oid = state_dict.get("anchor_object_ids", None)
         oid_shape = tuple(oid.shape) if oid is not None else (N,)
-        self._buffer_assign("anchor_object_ids", torch.empty(oid_shape, device=device, dtype=dt("anchor_object_ids", torch.long)))
+        self._buffer_assign(
+            "anchor_object_ids",
+            torch.empty(oid_shape, device=device, dtype=dt("anchor_object_ids", torch.long)),
+        )
 
         aga = state_dict.get("anchor_gradient_accum", None)
         aga_shape = tuple(aga.shape) if aga is not None else (N,)
-        self._buffer_assign("anchor_gradient_accum", torch.zeros(aga_shape, device=device, dtype=dt("anchor_gradient_accum", torch.float32)))
+        self._buffer_assign(
+            "anchor_gradient_accum",
+            torch.zeros(aga_shape, device=device, dtype=dt("anchor_gradient_accum", torch.float32)),
+        )
 
         agc = state_dict.get("anchor_gradient_count", None)
         agc_shape = tuple(agc.shape) if agc is not None else (N,)
-        self._buffer_assign("anchor_gradient_count", torch.zeros(agc_shape, device=device, dtype=dt("anchor_gradient_count", torch.int32)))
+        self._buffer_assign(
+            "anchor_gradient_count",
+            torch.zeros(agc_shape, device=device, dtype=dt("anchor_gradient_count", torch.int32)),
+        )
+
+        als = state_dict.get("anchor_lowgrad_streak", None)
+        als_shape = tuple(als.shape) if als is not None else (N,)
+        self._buffer_assign(
+            "anchor_lowgrad_streak",
+            torch.zeros(als_shape, device=device, dtype=dt("anchor_lowgrad_streak", torch.int32)),
+        )
 
         self._num_anchors = int(N)
         self._num_gaussians = int(N * self.k)
@@ -641,7 +843,12 @@ class ObjectGSModel(nn.Module):
             raise
 
     @classmethod
-    def from_checkpoint(cls, ckpt: Union[str, Path, Dict], device: Union[str, torch.device] = "cuda", map_location=None):
+    def from_checkpoint(
+        cls,
+        ckpt: Union[str, Path, Dict],
+        device: Union[str, torch.device] = "cuda",
+        map_location=None,
+    ):
         """
         Build a FRESH model instance whose anchor tensors match the checkpoint.
         Returns (model, ckpt_dict).
