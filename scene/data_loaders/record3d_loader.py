@@ -59,6 +59,7 @@ from scene.data_loaders.raw_pc_processing import (
     print_semantic_summary,
     # Legacy wrapper still available if needed
     process_pointcloud_with_semantics,
+    remove_small_clusters_label_aware_v2
 )
 
 
@@ -597,8 +598,8 @@ def reconstruct_from_rgbd_with_semantics(
 
     # semantic voting
     prefer_nonzero: bool = True,
-    min_nonzero_votes: int = 1,
-    min_nonzero_ratio: float = 0.05,
+    min_nonzero_votes: int = 2,
+    min_nonzero_ratio: float = 0.01,
     background_id: int = 0,
 
     # cluster + outlier
@@ -683,7 +684,7 @@ def reconstruct_from_rgbd_with_semantics(
     # Step 2: Label-aware cluster cleaning (DBSCAN)
     # Comment out this block to skip DBSCAN
     # =========================================================================
-    points, colors, obj_ids = remove_small_clusters_label_aware(
+    points, colors, obj_ids = remove_small_clusters_label_aware_v2(
         points, colors, obj_ids,
         eps=cluster_eps,
         min_cluster_size=min_cluster_size,
@@ -707,12 +708,12 @@ def reconstruct_from_rgbd_with_semantics(
     # Step 4: Remove disconnected chunks (floating artifacts)
     # Comment out this block to skip chunk removal
     # =========================================================================
-    points, colors, obj_ids = remove_disconnected_chunks(
-        points, colors, obj_ids,
-        eps=0.15,        # Points within 15cm are neighbors
-        min_samples=10,  # Need 10+ points to form a cluster core
-        verbose=True,
-    )
+    # points, colors, obj_ids = remove_disconnected_chunks(
+    #     points, colors, obj_ids,
+    #     eps=0.15,        # Points within 15cm are neighbors
+    #     min_samples=10,  # Need 10+ points to form a cluster core
+    #     verbose=True,
+    # )
 
     # =========================================================================
     # Step 5: Remap object IDs to contiguous values
